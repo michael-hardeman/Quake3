@@ -834,13 +834,7 @@ static void vk_transition_storage_image(Ctx *C) {
 #define BSP_BRUSHES     8
 #define BSP_BRUSHSIDES  9
 #define BSP_LIGHTMAPS 14
-#define CONTENTS_SOLID      1
-#define CONTENTS_LAVA       8
-#define CONTENTS_SLIME      16
-#define CONTENTS_WATER      32
-#define CONTENTS_PLAYERCLIP 0x10000
-#define MASK_ALL            (-1)
-#define MASK_PLAYERSOLID    (CONTENTS_SOLID|CONTENTS_PLAYERCLIP)
+#define CONTENTS_SOLID  1
 #define SURF_CLIP_EPS   0.125f
 #define MST_PLANAR    1
 #define MST_PATCH     2
@@ -863,26 +857,6 @@ typedef struct { I32 cluster, area;
 typedef struct { I32 first_side, n_sides, shader; } CBrush;
 typedef struct { I32 plane, shader; } CBrushSide;
 
-typedef struct { F32 normal[3]; F32 dist; U8 signbits; } PPlane;
-
-typedef struct {
-    int  surfPlane;       /* index into PatchCol.planes */
-    int  nBorders;        /* 3 edge + 1 back = 4 */
-    int  borders[4];      /* plane indices */
-} PFacet;
-
-typedef struct {
-    V3      bounds[2];    /* AABB min/max for quick rejection */
-    PPlane *planes;  int nPlanes;
-    PFacet *facets;  int nFacets;
-} PatchCol;
-
-typedef struct {
-    int       contents;
-    U32       checkcount;
-    PatchCol *pc;
-} CPatch;
-
 typedef struct {
     CPlane     *planes;     U32 n_planes;
     CNode      *nodes;      U32 n_nodes;
@@ -893,9 +867,6 @@ typedef struct {
     I32        *shd_contents;
     U32         check;
     U32        *brush_check;
-    CPatch     *patches;    U32 n_patches;
-    I32        *leaf_surfs; U32 n_leaf_surfs;
-    U32        *patch_check;
 } ColMap;
 
 static Vtx bvtx_conv(const BVtx *b) {
@@ -960,7 +931,6 @@ static U32 bsp_tess_patch(const BVtx *cg, int pw, int ph,
 }
 
 static Spawn bsp_find_spawn(const U8 *data, const BHdr *hdr);
-static PatchCol *cm_gen_patch_collide(const BVtx *ctrl, int pw, int ph);
 
 static Scene scene_load_bsp(const char *path, Spawn *out_spawn, ColMap *out_col) {
     FILE *f=fopen(path,"rb");
@@ -1150,33 +1120,8 @@ static Scene scene_load_bsp(const char *path, Spawn *out_spawn, ColMap *out_col)
         /* per-brush checkcount for trace dedup */
         cm->brush_check = calloc(cm->n_brushes, sizeof(U32));
         cm->check = 0;
-        /* leaf surfaces: int[] (lump 5) */
-        cm->n_leaf_surfs = (U32)hdr->lumps[BSP_LEAFSURFS].len / 4;
-        cm->leaf_surfs = malloc(sizeof(I32) * cm->n_leaf_surfs);
-        memcpy(cm->leaf_surfs, data + hdr->lumps[BSP_LEAFSURFS].ofs,
-               sizeof(I32) * cm->n_leaf_surfs);
-        /* patch collision */
-        cm->n_patches = nbf;
-        cm->patches = calloc(nbf, sizeof(CPatch));
-        cm->patch_check = calloc(nbf, sizeof(U32));
-        U32 total_patch_facets = 0, total_patch_planes = 0;
-        U32 n_col_patches = 0;
-        for (U32 i = 0; i < nbf; i++) {
-            if (bf[i].type != MST_PATCH) continue;
-            I32 shd = bf[i].shd;
-            if (shd < 0 || (U32)shd >= nbs) continue;
-            if (!(bs[shd].contents & MASK_PLAYERSOLID)) continue;
-            cm->patches[i].contents = bs[shd].contents;
-            cm->patches[i].pc = cm_gen_patch_collide(
-                &bv[bf[i].fv], bf[i].pw, bf[i].ph);
-            total_patch_facets += (U32)cm->patches[i].pc->nFacets;
-            total_patch_planes += (U32)cm->patches[i].pc->nPlanes;
-            n_col_patches++;
-        }
         printf("[col] %u planes, %u nodes, %u leafs, %u brushes, %u sides\n",
                cm->n_planes, cm->n_nodes, cm->n_leafs, cm->n_brushes, cm->n_sides);
-        printf("[patch] %u patches, %u facets, %u planes\n",
-               n_col_patches, total_patch_facets, total_patch_planes);
     }
 
     free(data);
@@ -1280,7 +1225,6 @@ typedef struct {
     V3    offsets[8];
     Trace trace;
     int   isPoint;
-    int   contents;    /* trace content mask (brush/patch contents ANDed with this) */
     Sphere sphere;
 } TraceWork;
 
@@ -1363,250 +1307,16 @@ static void cm_trace_brush(TraceWork *tw, const CBrush *brush, const ColMap *cm)
     }
 }
 
-/* Generate collision facets from a tessellated BSP patch.
-   ctrl = control points (BVtx), pw/ph = patch width/height. */
-static PatchCol *cm_gen_patch_collide(const BVtx *ctrl, int pw, int ph) {
-    int nx = (pw-1)/2, ny = (ph-1)/2, L = TESS_LOD, S = L+1;
-    int max_tris = nx * ny * L * L * 2;
-    int max_planes = max_tris * 5; /* surf + 3 edges + back */
-
-    PatchCol *pc = calloc(1, sizeof(PatchCol));
-    pc->planes = malloc(sizeof(PPlane) * (U32)max_planes);
-    pc->facets = malloc(sizeof(PFacet) * (U32)max_tris);
-    pc->nPlanes = 0;
-    pc->nFacets = 0;
-    pc->bounds[0] = v3( 1e18f,  1e18f,  1e18f);
-    pc->bounds[1] = v3(-1e18f, -1e18f, -1e18f);
-
-    /* tessellate positions only (Y-up swizzled) */
-    int gridTotal = nx * ny * S * S;
-    V3 *grid = malloc(sizeof(V3) * (U32)gridTotal);
-
-    for (int py2 = 0; py2 < ny; py2++)
-    for (int px2 = 0; px2 < nx; px2++) {
-        V3 cp[3][3];
-        for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++) {
-            const BVtx *v = &ctrl[(py2*2+r)*pw + (px2*2+c)];
-            cp[r][c] = v3(v->xyz[0], v->xyz[2], -v->xyz[1]);
-        }
-        int base = (py2*nx + px2) * S * S;
-        for (int j = 0; j <= L; j++) {
-            F32 t = (F32)j / L;
-            V3 qp[3];
-            for (int r = 0; r < 3; r++)
-                qp[r] = bez3v(cp[r][0], cp[r][1], cp[r][2], t);
-            for (int i = 0; i <= L; i++) {
-                F32 s2 = (F32)i / L;
-                V3 pos = bez3v(qp[0], qp[1], qp[2], s2);
-                grid[base + j*S + i] = pos;
-                /* expand bounds */
-                if (pos.x < pc->bounds[0].x) pc->bounds[0].x = pos.x;
-                if (pos.y < pc->bounds[0].y) pc->bounds[0].y = pos.y;
-                if (pos.z < pc->bounds[0].z) pc->bounds[0].z = pos.z;
-                if (pos.x > pc->bounds[1].x) pc->bounds[1].x = pos.x;
-                if (pos.y > pc->bounds[1].y) pc->bounds[1].y = pos.y;
-                if (pos.z > pc->bounds[1].z) pc->bounds[1].z = pos.z;
-            }
-        }
-    }
-
-    /* build facets from grid triangles */
-    for (int py2 = 0; py2 < ny; py2++)
-    for (int px2 = 0; px2 < nx; px2++) {
-        int base = (py2*nx + px2) * S * S;
-        for (int j = 0; j < L; j++)
-        for (int i = 0; i < L; i++) {
-            V3 a = grid[base + j*S + i];
-            V3 b = grid[base + j*S + i + 1];
-            V3 c = grid[base + (j+1)*S + i];
-            V3 d = grid[base + (j+1)*S + i + 1];
-
-            /* two triangles per quad: (a,c,b) and (b,c,d) — matching render winding */
-            V3 tri[2][3] = {{a,c,b},{b,c,d}};
-
-            for (int t = 0; t < 2; t++) {
-                V3 A = tri[t][0], B = tri[t][1], C = tri[t][2];
-                V3 e0 = v3sub(B, A), e1 = v3sub(C, A);
-                V3 sn = v3norm(v3cross(e0, e1));
-                F32 sl = sqrtf(v3dot(v3cross(e0, e1), v3cross(e0, e1)));
-                if (sl < 1e-6f) continue; /* degenerate triangle */
-
-                PFacet *fac = &pc->facets[pc->nFacets];
-                fac->nBorders = 4;
-
-                /* surface plane */
-                int sp = pc->nPlanes++;
-                pc->planes[sp].normal[0] = sn.x;
-                pc->planes[sp].normal[1] = sn.y;
-                pc->planes[sp].normal[2] = sn.z;
-                pc->planes[sp].dist = v3dot(sn, A);
-                pc->planes[sp].signbits = (U8)((sn.x<0)|((sn.y<0)<<1)|((sn.z<0)<<2));
-                fac->surfPlane = sp;
-
-                /* edge border planes (inward-pointing) */
-                V3 edges[3][2] = {{A,B},{B,C},{C,A}};
-                for (int e = 0; e < 3; e++) {
-                    V3 edge = v3sub(edges[e][1], edges[e][0]);
-                    V3 bn = v3norm(v3cross(sn, edge));
-                    int bp = pc->nPlanes++;
-                    pc->planes[bp].normal[0] = bn.x;
-                    pc->planes[bp].normal[1] = bn.y;
-                    pc->planes[bp].normal[2] = bn.z;
-                    pc->planes[bp].dist = v3dot(bn, edges[e][0]);
-                    pc->planes[bp].signbits = (U8)((bn.x<0)|((bn.y<0)<<1)|((bn.z<0)<<2));
-                    fac->borders[e] = bp;
-                }
-
-                /* back plane (inverted surface, 1 unit behind) */
-                int bp = pc->nPlanes++;
-                pc->planes[bp].normal[0] = -sn.x;
-                pc->planes[bp].normal[1] = -sn.y;
-                pc->planes[bp].normal[2] = -sn.z;
-                pc->planes[bp].dist = -v3dot(sn, A) + 1.f;
-                pc->planes[bp].signbits = (U8)((-sn.x<0)|((-sn.y<0)<<1)|((-sn.z<0)<<2));
-                fac->borders[3] = bp;
-
-                pc->nFacets++;
-            }
-        }
-    }
-
-    free(grid);
-
-    /* pad bounds by player extents for trace AABB rejection */
-    pc->bounds[0] = v3sub(pc->bounds[0], v3(15+1, 24+1, 15+1));
-    pc->bounds[1] = v3add(pc->bounds[1], v3(15+1, 32+1, 15+1));
-
-    return pc;
-}
-
-/* Trace a moving AABB/capsule against a patch collision structure.
-   Mirrors Q3's CM_TraceThroughPatchCollide. */
-static void cm_trace_patch(TraceWork *tw, const PatchCol *pc) {
-    /* AABB rejection against patch bounds */
-    V3 tmin, tmax;
-    if (tw->start.x < tw->end.x) { tmin.x = tw->start.x; tmax.x = tw->end.x; }
-    else { tmin.x = tw->end.x; tmax.x = tw->start.x; }
-    if (tw->start.y < tw->end.y) { tmin.y = tw->start.y; tmax.y = tw->end.y; }
-    else { tmin.y = tw->end.y; tmax.y = tw->start.y; }
-    if (tw->start.z < tw->end.z) { tmin.z = tw->start.z; tmax.z = tw->end.z; }
-    else { tmin.z = tw->end.z; tmax.z = tw->start.z; }
-
-    if (tmin.x > pc->bounds[1].x || tmax.x < pc->bounds[0].x) return;
-    if (tmin.y > pc->bounds[1].y || tmax.y < pc->bounds[0].y) return;
-    if (tmin.z > pc->bounds[1].z || tmax.z < pc->bounds[0].z) return;
-
-    for (int fi = 0; fi < pc->nFacets; fi++) {
-        const PFacet *fac = &pc->facets[fi];
-        F32 enterFrac = -1.f, leaveFrac = 1.f;
-        const PPlane *hitplane = NULL;
-        int startout = 0, getout = 0;
-
-        /* test surface plane + 3 borders + back = 5 planes total */
-        /* planes[0]=surface, planes[1..3]=borders, planes[4]=back */
-        int planeIds[5];
-        planeIds[0] = fac->surfPlane;
-        for (int k = 0; k < fac->nBorders; k++) planeIds[k+1] = fac->borders[k];
-        int ntest = 1 + fac->nBorders;
-
-        for (int pi = 0; pi < ntest; pi++) {
-            const PPlane *pp = &pc->planes[planeIds[pi]];
-            F32 dist, d1, d2;
-
-            if (tw->sphere.use) {
-                dist = pp->dist + tw->sphere.radius;
-                F32 t2 = pp->normal[0]*tw->sphere.offset.x +
-                         pp->normal[1]*tw->sphere.offset.y +
-                         pp->normal[2]*tw->sphere.offset.z;
-                V3 sp, ep;
-                if (t2 > 0) {
-                    sp = v3sub(tw->start, tw->sphere.offset);
-                    ep = v3sub(tw->end,   tw->sphere.offset);
-                } else {
-                    sp = v3add(tw->start, tw->sphere.offset);
-                    ep = v3add(tw->end,   tw->sphere.offset);
-                }
-                d1 = sp.x*pp->normal[0]+sp.y*pp->normal[1]+sp.z*pp->normal[2]-dist;
-                d2 = ep.x*pp->normal[0]+ep.y*pp->normal[1]+ep.z*pp->normal[2]-dist;
-            } else if (tw->isPoint) {
-                dist = pp->dist;
-                d1 = tw->start.x*pp->normal[0]+tw->start.y*pp->normal[1]+
-                     tw->start.z*pp->normal[2]-dist;
-                d2 = tw->end.x*pp->normal[0]+tw->end.y*pp->normal[1]+
-                     tw->end.z*pp->normal[2]-dist;
-            } else {
-                const V3 *ofs = &tw->offsets[pp->signbits];
-                dist = pp->dist - (((F32*)ofs)[0]*pp->normal[0]+
-                                   ((F32*)ofs)[1]*pp->normal[1]+
-                                   ((F32*)ofs)[2]*pp->normal[2]);
-                d1 = tw->start.x*pp->normal[0]+tw->start.y*pp->normal[1]+
-                     tw->start.z*pp->normal[2]-dist;
-                d2 = tw->end.x*pp->normal[0]+tw->end.y*pp->normal[1]+
-                     tw->end.z*pp->normal[2]-dist;
-            }
-
-            if (d2 > 0) getout = 1;
-            if (d1 > 0) startout = 1;
-
-            if (d1 > 0 && (d2 >= SURF_CLIP_EPS || d2 >= d1)) goto next_facet;
-            if (d1 <= 0 && d2 <= 0) continue;
-
-            if (d1 > d2) {
-                F32 f = (d1 - SURF_CLIP_EPS) / (d1 - d2);
-                if (f < 0) f = 0;
-                if (f > enterFrac) { enterFrac = f; hitplane = pp; }
-            } else {
-                F32 f = (d1 + SURF_CLIP_EPS) / (d1 - d2);
-                if (f > 1) f = 1;
-                if (f < leaveFrac) leaveFrac = f;
-            }
-        }
-
-        if (!startout) {
-            tw->trace.startsolid = 1;
-            if (!getout) tw->trace.allsolid = 1;
-            tw->trace.fraction = 0;
-            return;
-        }
-
-        if (enterFrac < leaveFrac && enterFrac > -1 &&
-            enterFrac < tw->trace.fraction) {
-            if (enterFrac < 0) enterFrac = 0;
-            tw->trace.fraction = enterFrac;
-            tw->trace.normal = v3(hitplane->normal[0], hitplane->normal[1],
-                                  hitplane->normal[2]);
-        }
-        continue;
-next_facet:;
-    }
-}
-
 static void cm_trace_leaf(TraceWork *tw, const CLeaf *leaf, ColMap *cm) {
-    /* brush loop */
     for (I32 k = 0; k < leaf->n_brushes; k++) {
         I32 bi = cm->leaf_brushes[leaf->first_brush + k];
         if ((U32)bi >= cm->n_brushes) continue;
         if (cm->brush_check[bi] == cm->check) continue;
         cm->brush_check[bi] = cm->check;
         const CBrush *b = &cm->brushes[bi];
-        if (!(cm->shd_contents[b->shader] & tw->contents)) continue;
+        if (!(cm->shd_contents[b->shader] & CONTENTS_SOLID)) continue;
         cm_trace_brush(tw, b, cm);
         if (tw->trace.fraction == 0.f) return;
-    }
-    /* patch loop */
-    if (cm->patches && cm->leaf_surfs) {
-        for (I32 k = 0; k < leaf->n_surfs; k++) {
-            I32 si = cm->leaf_surfs[leaf->first_surf + k];
-            if (si < 0 || (U32)si >= cm->n_patches) continue;
-            if (cm->patch_check[si] == cm->check) continue;
-            cm->patch_check[si] = cm->check;
-            CPatch *p = &cm->patches[si];
-            if (!p->pc) continue;
-            if (!(p->contents & tw->contents)) continue;
-            cm_trace_patch(tw, p->pc);
-            if (tw->trace.fraction == 0.f) return;
-        }
     }
 }
 
@@ -1772,14 +1482,12 @@ static void __attribute__((unused)) cm_trace_capsule_capsule(TraceWork *tw,
                     v3add(end, tw->sphere.offset));
 }
 
-static Trace cm_trace(V3 start, V3 end, V3 mins, V3 maxs, ColMap *cm,
-                      int capsule, int mask) {
+static Trace cm_trace(V3 start, V3 end, V3 mins, V3 maxs, ColMap *cm, int capsule) {
     TraceWork tw;
     memset(&tw, 0, sizeof(tw));
     tw.start = start;
     tw.end = end;
     tw.trace.fraction = 1.f;
-    tw.contents = mask;
 
     tw.extents = v3((-mins.x > maxs.x ? -mins.x : maxs.x),
                     (-mins.y > maxs.y ? -mins.y : maxs.y),
@@ -1849,7 +1557,7 @@ typedef struct {
 static V3 pm_maxs(const Player *p) { return v3(15, p->ducked ? 16 : 32, 15); }
 
 static Trace pm_trace(V3 start, V3 end, const Player *p, ColMap *cm) {
-    return cm_trace(start, end, PM_MINS, pm_maxs(p), cm, 1, MASK_PLAYERSOLID);
+    return cm_trace(start, end, PM_MINS, pm_maxs(p), cm, 1);
 }
 
 static V3 pm_clip_velocity(V3 in, V3 normal, F32 overbounce) {
@@ -1992,10 +1700,12 @@ static int pm_slide_move(Player *p, ColMap *cm, F32 dt, int gravity) {
 
         if (numplanes >= MAX_CLIP_PLANES) { p->vel = v3(0,0,0); return 1; }
 
-        /* Q3: if same plane as before, nudge velocity along it */
+        /* Q3: if same plane as before, nudge velocity along it.
+           Relaxed from 0.99 to 0.85: capsule traces can produce varied
+           normals at brush seams (bevel planes are designed for AABB). */
         int samePlane = 0;
         for (int i = 0; i < numplanes; i++) {
-            if (v3dot(tr.normal, planes[i]) > 0.99f) {
+            if (v3dot(tr.normal, planes[i]) > 0.85f) {
                 p->vel = v3add(tr.normal, p->vel);
                 samePlane = 1;
                 break;
@@ -2024,18 +1734,27 @@ static int pm_slide_move(Player *p, ColMap *cm, F32 dt, int gravity) {
                 if (v3dot(cv, planes[i]) >= 0) continue;
 
                 /* slide along crease between planes[i] and planes[j] */
-                V3 dir = v3norm(v3cross(planes[i], planes[j]));
-                F32 d = v3dot(dir, p->vel);
-                cv = v3scale(dir, d);
-                d = v3dot(dir, endVelocity);
-                ecv = v3scale(dir, d);
+                V3 dv = v3cross(planes[i], planes[j]);
+                F32 dlen2 = v3dot(dv, dv);
+                if (dlen2 < 0.001f) {
+                    /* nearly parallel planes: degenerate crease.
+                       Nudge velocity out along latest normal. */
+                    cv = v3add(p->vel, tr.normal);
+                    ecv = v3add(endVelocity, tr.normal);
+                } else {
+                    V3 dir = v3scale(dv, 1.f / sqrtf(dlen2));
+                    F32 d = v3dot(dir, p->vel);
+                    cv = v3scale(dir, d);
+                    d = v3dot(dir, endVelocity);
+                    ecv = v3scale(dir, d);
 
-                /* check for triple plane interaction → stop dead */
-                int k;
-                for (k = 0; k < numplanes; k++) {
-                    if (k == i || k == j) continue;
-                    if (v3dot(cv, planes[k]) >= 0.1f) continue;
-                    p->vel = v3(0,0,0); return 1;
+                    /* check for triple plane interaction → stop dead */
+                    int k;
+                    for (k = 0; k < numplanes; k++) {
+                        if (k == i || k == j) continue;
+                        if (v3dot(cv, planes[k]) >= 0.1f) continue;
+                        p->vel = v3(0,0,0); return 1;
+                    }
                 }
             }
 
@@ -2169,7 +1888,7 @@ static void pm_check_duck(Player *p, ColMap *cm, Input in) {
            bottom matches our current crouched capsule bottom */
         V3 test = v3add(p->pos, v3(0, dh, 0));
         V3 stand = v3(15, 32, 15);
-        Trace tr = cm_trace(test, test, PM_MINS, stand, cm, 1, MASK_PLAYERSOLID);
+        Trace tr = cm_trace(test, test, PM_MINS, stand, cm, 1);
         if (!tr.allsolid) {
             p->ducked = 0;
             p->pos = test;
@@ -3157,13 +2876,13 @@ int main(int argc, char **argv) {
             player.pos = spawn.origin;
             /* nudge upward out of solid (capsule may clip into floor at spawn) */
             for (int i = 0; i < 128; i++) {
-                Trace t = cm_trace(player.pos, player.pos, PM_MINS, stand, &col, 1, MASK_PLAYERSOLID);
+                Trace t = cm_trace(player.pos, player.pos, PM_MINS, stand, &col, 1);
                 if (!t.allsolid) break;
                 player.pos.y += 1.f;
             }
             /* drop to floor from current valid position */
             V3 down = v3add(player.pos, v3(0, -256, 0));
-            Trace drop = cm_trace(player.pos, down, PM_MINS, stand, &col, 1, MASK_PLAYERSOLID);
+            Trace drop = cm_trace(player.pos, down, PM_MINS, stand, &col, 1);
             if (drop.fraction < 1.f && !drop.allsolid)
                 player.pos = drop.endpos;
             printf("[spawn] placed at (%.1f, %.1f, %.1f)\n",
