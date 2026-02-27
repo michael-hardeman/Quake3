@@ -1,12 +1,20 @@
-/* <<quake3>> = <<types>> <<math>> <<vkrt-fns>> <<vkutil>> <<tga-loader>>
-               <<vkinit>> <<bsp-loader>> <<bsp-entities>> <<collision>>
-               <<physics>> <<scene>> <<blas>> <<tlas>> <<pipeline>>
-               <<descriptors>> <<camera>> <<input>> <<render>>
-               <<validate>> <<main>>                                    */
+/* <<quake3>> = <<types>> <<math>> <<vulkan_raytracing_functions>>
+               <<vulkan_utilities>> <<tga_loader>> <<md3_loader>>
+               <<vulkan_init>> <<bsp_loader>> <<bsp_entities>>
+               <<collision>> <<physics>> <<scene>>
+               <<bottom_level_acceleration>> <<top_level_acceleration>>
+               <<pipeline>> <<descriptors>> <<camera>> <<weapon>>
+               <<input>> <<render>> <<validate>> <<main>>           */
 
+// Language Extensions
+#include <iso646.h>
+
+// Media Layer/Graphics
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
+
+// Standard Libraries
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,8 +22,9 @@
 #include <math.h>
 #include <assert.h>
 
-/* <<types>> ============================================================= */
+/* <<types>> ================================================================================================ */
 
+// Comment here !!!
 typedef uint8_t  U8;
 typedef uint16_t U16;
 typedef int16_t  I16;
@@ -24,2913 +33,4370 @@ typedef uint32_t U32;
 typedef uint64_t U64;
 typedef float    F32;
 
-typedef struct { F32 x,y,z;   } V3;
-typedef struct { F32 x,y,z,w; } V4;
-typedef struct { F32 m[16];   } M4;
+// Three-component floating-point vector for positions, directions, and velocities
+typedef struct {F32 x, y, z;    } V3;
 
-typedef struct { int fwd,back,left,right,jump,fire,crouch; float dx,dy; } Input;
+// Four-component floating-point vector for homogeneous coordinates and RGBA colors
+typedef struct {F32 x, y, z, w; } V4;
 
-typedef struct { VkBuffer b; VkDeviceMemory m; VkDeviceAddress a; U64 sz; } Buf;
-typedef struct { VkImage  i; VkDeviceMemory m; VkImageView     v; VkFormat f; } Img;
-typedef struct { VkAccelerationStructureKHR h; Buf b; VkDeviceAddress a; } AS;
+// A 4x4 column-major matrix for view, projection, and model transforms
+typedef struct {F32 Elements[16]; } M4;
 
+// Sampled keyboard and mouse state for a single frame
 typedef struct {
-    V3   pos, vel;
-    F32  yaw, pitch;
-    M4   inv_v, inv_p;
-    U32  frame;
-} Cam;
+  int   Forward, Back, Left, Right, Jump, Fire, Crouch;  // Binary key states: 1 if held, 0 otherwise
+  float Delta_X, Delta_Y;                                // Mouse displacement in pixels since last frame
+} Input;
 
-typedef struct { F32 pos[3], _p; F32 uv[2], _q[2]; F32 n[3], _r; } Vtx;
-
+// GPU-resident buffer with its backing memory and optional device address
 typedef struct {
-    Vtx  *verts;  U32 nv;
-    U32  *idxs;   U32 ni;
-    V4   *mats;   U32 nm;
-    U32  *tex_ids;           /* tex_ids[tri_idx] = shader index */
-    char (*tex_names)[64];   /* shader names from BSP shaders lump */
-    U32   tri_count;
-    U8   *lm_atlas;          /* lightmap atlas RGBA pixels */
-    U32   lm_w, lm_h;       /* atlas dimensions */
+  VkBuffer        Buffer;   // Vulkan buffer handle
+  VkDeviceMemory  Memory;   // Device memory allocation backing the buffer
+  VkDeviceAddress Address;  // Buffer device address for shader access (zero if not requested)
+  U64             Size;     // Allocation size in bytes
+} Gpu_Buffer;
+
+// GPU-resident image with its backing memory, view, and format metadata
+typedef struct {
+  VkImage        Image;   // Vulkan image handle
+  VkDeviceMemory Memory;  // Device memory allocation backing the image
+  VkImageView    View;    // Image view used for sampling or storage access
+  VkFormat       Format;  // Pixel format of the image
+} Gpu_Image;
+
+// Ray tracing acceleration structure with its backing buffer and device address
+typedef struct {
+  VkAccelerationStructureKHR Handle;  // Opaque acceleration structure handle
+  Gpu_Buffer                 Buffer;  // GPU buffer holding the acceleration structure data
+  VkDeviceAddress            Address; // Device address for referencing from shaders and TLAS builds
+} Acceleration_Structure;
+
+// Per-frame camera state uploaded to the GPU as a uniform buffer
+typedef struct {
+  V3  Position, Velocity;                   // World-space eye position and movement velocity
+  F32 Yaw, Pitch;                           // Euler angles in radians for horizontal and vertical look
+  M4  Inverse_View, Inverse_Projection;     // Inverse matrices for reconstructing world rays from screen coordinates
+  U32 Frame;                                // Monotonically increasing frame counter for temporal effects
+} Camera;
+
+// Interleaved vertex layout matching the GPU shader input (std430, 48 bytes per vertex)
+typedef struct {
+  F32 Position[3],   Padding_A;      // World-space XYZ position; padding aligns to 16 bytes
+  F32 Texture_Uv[2], Lightmap_Uv[2]; // Diffuse texture coordinates and lightmap atlas coordinates
+  F32 Normal[3],     Padding_B;      // Surface normal; padding aligns to 16 bytes
+} Vertex;
+
+// Aggregate scene geometry and material data loaded from a BSP or generated procedurally
+typedef struct {
+  Vertex  *Vertices;       U32 Vertex_Count;       // Vertex array and its element count
+  U32     *Indices;        U32 Index_Count;         // Index array (triangles) and its element count
+  V4      *Materials;      U32 Material_Count;      // Per-surface RGBA material tints and their count
+  U32     *Texture_Ids;                             // Per-triangle texture index into the texture array
+  char   (*Texture_Names)[64];                      // Shader/texture name strings from the BSP (64-char max each)
+  U32      Triangle_Count;                          // Total triangles (Index_Count / 3)
+  U8      *Lightmap_Atlas;                          // Packed lightmap atlas in RGBA8 format
+  U32      Lightmap_Width, Lightmap_Height;         // Atlas dimensions in pixels
 } Scene;
 
-typedef struct { V3 origin; F32 angle; } Spawn;
+// Single spawn point parsed from the BSP entity lump
+typedef struct {V3 Origin; F32 Angle; } Spawn;     // World-space origin and facing angle in degrees
 
+// Resolved function pointers for Vulkan ray tracing extension commands
 typedef struct {
-    PFN_vkCreateAccelerationStructureKHR           CreateAS;
-    PFN_vkDestroyAccelerationStructureKHR          DestroyAS;
-    PFN_vkGetAccelerationStructureBuildSizesKHR    ASBuildSizes;
-    PFN_vkCmdBuildAccelerationStructuresKHR        CmdBuildAS;
-    PFN_vkGetAccelerationStructureDeviceAddressKHR ASAddr;
-    PFN_vkCreateRayTracingPipelinesKHR             CreateRTPipe;
-    PFN_vkGetRayTracingShaderGroupHandlesKHR       RTHandles;
-    PFN_vkCmdTraceRaysKHR                          CmdTrace;
-} RTFn;
+  PFN_vkCreateAccelerationStructureKHR               Create_Acceleration_Structure;   // Creates a BLAS or TLAS
+  PFN_vkDestroyAccelerationStructureKHR              Destroy_Acceleration_Structure;  // Destroys an acceleration structure
+  PFN_vkGetAccelerationStructureBuildSizesKHR        Get_Build_Sizes;                 // Queries scratch and result buffer sizes
+  PFN_vkCmdBuildAccelerationStructuresKHR            Command_Build;                   // Records a build or update command
+  PFN_vkGetAccelerationStructureDeviceAddressKHR     Get_Device_Address;              // Retrieves the device address of a structure
+  PFN_vkCreateRayTracingPipelinesKHR                 Create_Pipeline;                 // Creates a ray tracing pipeline
+  PFN_vkGetRayTracingShaderGroupHandlesKHR           Get_Shader_Group_Handles;        // Retrieves shader group handles for the SBT
+  PFN_vkCmdTraceRaysKHR                              Command_Trace_Rays;              // Records a ray dispatch command
+} Raytracing_Functions;
 
+// Central rendering context holding all Vulkan state, GPU resources, and synchronization objects
 typedef struct {
-    SDL_Window  *win;
-    int          W, H;
-    VkInstance   inst;
-    VkSurfaceKHR surf;
-    VkPhysicalDevice pd;
-    VkDevice     dev;
-    VkQueue      q;
-    U32          qi;
-    VkSwapchainKHR sc;
-    VkImage      sc_img[8];
-    VkImageView  sc_view[8];
-    U32          sc_n;
-    VkFormat     sc_fmt;
-    VkExtent2D   sc_ext;
-    VkCommandPool   pool;
-    VkCommandBuffer cmd;
-    VkFence      fence;
-    VkSemaphore  sem_img, sem_done;
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rt_props;
-    RTFn         rt;
-    Img          rt_img;
-    Buf          cam_ubo;
-    Buf          vbuf, ibuf, mbuf;
-    Buf          tex_id_buf;          /* per-tri shader index SSBO (binding 6) */
-    VkImage     *tex_imgs;
-    VkDeviceMemory *tex_mems;
-    VkImageView *tex_views;
-    VkSampler    tex_sampler;
-    U32          n_tex;
-    U32          n_tex_loaded;        /* how many were real TGA files */
-    VkImage      lm_img;
-    VkDeviceMemory lm_mem;
-    VkImageView  lm_view;
-    VkSampler    lm_sampler;
-    AS           blas, tlas;
-    VkPipelineLayout pipe_layout;
-    VkPipeline       pipe;
-    Buf              sbt;
-    VkStridedDeviceAddressRegionKHR sbt_rgen, sbt_miss, sbt_hit, sbt_call;
-    VkDescriptorSetLayout dsl;
-    VkDescriptorPool      dp;
-    VkDescriptorSet       ds;
-    int quit;
-    F32 dt;
-} Ctx;
+  SDL_Window       *Window;                 // SDL window for presentation and input
+  int               Width, Height;          // Window dimensions in pixels
+  VkInstance        Instance;               // Vulkan instance with validation layers
+  VkSurfaceKHR     Surface;                // Window surface for presentation
+  VkPhysicalDevice Physical_Device;         // Selected GPU with ray tracing support
+  VkDevice         Device;                  // Logical device created from the physical device
+  VkQueue          Queue;                   // Universal queue for graphics, compute, and transfer
+  U32              Queue_Family_Index;       // Index of the queue family supporting all operations
 
-/* <<math>> ============================================================== */
+  // Swapchain state
+  VkSwapchainKHR   Swapchain;              // Presentation swapchain
+  VkImage          Swapchain_Images[8];    // Swapchain image handles (up to 8 for triple+ buffering)
+  VkImageView      Swapchain_Views[8];     // Image views corresponding to each swapchain image
+  U32              Swapchain_Image_Count;   // Actual number of swapchain images acquired
+  VkFormat         Swapchain_Format;        // Surface format of the swapchain (e.g. B8G8R8A8_SRGB)
+  VkExtent2D       Swapchain_Extent;        // Swapchain resolution in pixels
 
-static V3  v3(F32 x,F32 y,F32 z)   { return (V3){x,y,z}; }
-static V3  v3add(V3 a,V3 b)         { return v3(a.x+b.x,a.y+b.y,a.z+b.z); }
-static V3  v3sub(V3 a,V3 b)         { return v3(a.x-b.x,a.y-b.y,a.z-b.z); }
-static V3  v3scale(V3 v,F32 s)      { return v3(v.x*s,v.y*s,v.z*s); }
-static F32 v3dot(V3 a,V3 b)         { return a.x*b.x+a.y*b.y+a.z*b.z; }
-static V3  v3cross(V3 a,V3 b)       { return v3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x); }
-static V3  v3norm(V3 a)             { F32 l=sqrtf(v3dot(a,a)); return l>1e-6f?v3scale(a,1.f/l):a; }
+  // Command recording and CPU-GPU synchronization
+  VkCommandPool    Command_Pool;            // Command pool for allocating command buffers
+  VkCommandBuffer  Command_Buffer;          // Single reusable command buffer for all GPU work
+  VkFence          Fence;                   // CPU-GPU synchronization fence for frame serialization
+  VkSemaphore      Semaphore_Image_Available;   // Signals when a swapchain image is ready
+  VkSemaphore      Semaphore_Render_Finished;   // Signals when rendering is complete for presentation
 
-static M4 m4id(void) {
-    M4 m = {0}; m.m[0]=m.m[5]=m.m[10]=m.m[15]=1; return m;
-}
-static M4 m4persp(F32 fovy_deg, F32 asp, F32 zn, F32 zf) {
-    F32 f = 1.f / tanf(fovy_deg * (float)M_PI / 360.f);
-    M4 m = {0};
-    m.m[0]=f/asp; m.m[5]=-f;
-    m.m[10]=zf/(zn-zf); m.m[11]=-1;
-    m.m[14]=zn*zf/(zn-zf);
-    return m;
-}
-static M4 m4view(V3 pos, F32 yaw, F32 pitch) {
-    F32 cy=cosf(yaw),sy=sinf(yaw),cp=cosf(pitch),sp=sinf(pitch);
-    V3 fwd = v3(sy*cp, -sp, -cy*cp);
-    V3 right = v3norm(v3cross(fwd, v3(0,1,0)));
-    V3 up    = v3cross(right, fwd);
-    M4 m = {0};
-    m.m[0]=right.x; m.m[4]=right.y; m.m[8] =right.z;
-    m.m[1]=up.x;    m.m[5]=up.y;    m.m[9] =up.z;
-    m.m[2]=-fwd.x;  m.m[6]=-fwd.y;  m.m[10]=-fwd.z;
-    m.m[12]=-(m.m[0]*pos.x+m.m[4]*pos.y+m.m[8] *pos.z);
-    m.m[13]=-(m.m[1]*pos.x+m.m[5]*pos.y+m.m[9] *pos.z);
-    m.m[14]=-(m.m[2]*pos.x+m.m[6]*pos.y+m.m[10]*pos.z);
-    m.m[15]=1;
-    return m;
-}
-static M4 m4inv_ortho(M4 m) {
-    M4 r = {0};
-    for(int i=0;i<3;i++) for(int j=0;j<3;j++) r.m[i*4+j]=m.m[j*4+i];
-    r.m[12]=-(r.m[0]*m.m[12]+r.m[4]*m.m[13]+r.m[8] *m.m[14]);
-    r.m[13]=-(r.m[1]*m.m[12]+r.m[5]*m.m[13]+r.m[9] *m.m[14]);
-    r.m[14]=-(r.m[2]*m.m[12]+r.m[6]*m.m[13]+r.m[10]*m.m[14]);
-    r.m[15]=1; return r;
-}
-static M4 m4inv_proj(M4 p) {
-    M4 r = {0};
-    r.m[0]  = 1.f/p.m[0];
-    r.m[5]  = 1.f/p.m[5];
-    r.m[11] = 1.f/p.m[14];
-    r.m[14] = 1.f/p.m[11];
-    r.m[15] = -p.m[10]/(p.m[11]*p.m[14]);
-    return r;
+  // Ray tracing extension state
+  VkPhysicalDeviceRayTracingPipelinePropertiesKHR Raytracing_Properties;  // SBT alignment and handle sizes
+  Raytracing_Functions                            Raytracing;             // Resolved ray tracing function pointers
+
+  // GPU storage images and scene data buffers
+  Gpu_Image        Raytracing_Storage_Image;    // Storage image written by ray generation shader
+  Gpu_Buffer       Camera_Uniform_Buffer;       // Uniform buffer for the Camera struct
+  Gpu_Buffer       Vertex_Buffer, Index_Buffer, Material_Buffer;  // Scene geometry and material data on GPU
+  Gpu_Buffer       Texture_Id_Buffer;           // Per-triangle texture index buffer
+
+  // Diffuse texture array
+  VkImage         *Texture_Images;          // Array of diffuse texture images
+  VkDeviceMemory  *Texture_Memories;        // Backing memory for each texture image
+  VkImageView     *Texture_Views;           // Image views for shader sampling of each texture
+  VkSampler        Texture_Sampler;         // Shared sampler with linear filtering and repeat wrap
+  U32              Texture_Count;           // Total number of texture slots allocated
+  U32              Textures_Loaded;         // Number of textures successfully loaded from disk
+
+  // Lightmap atlas
+  VkImage          Lightmap_Image;          // Packed lightmap atlas image
+  VkDeviceMemory   Lightmap_Memory;         // Backing memory for the lightmap image
+  VkImageView      Lightmap_View;           // Image view for lightmap sampling
+  VkSampler        Lightmap_Sampler;        // Sampler for lightmap lookups (linear, clamp-to-edge)
+
+  // Acceleration structures
+  Acceleration_Structure Bottom_Level, Top_Level;   // BLAS for world geometry and TLAS combining all instances
+
+  // Ray tracing pipeline and shader binding table
+  VkPipelineLayout Pipeline_Layout;             // Pipeline layout with descriptor set bindings
+  VkPipeline       Pipeline;                    // Ray tracing pipeline (rgen, rchit, rmiss, shadow rmiss)
+  Gpu_Buffer       Shader_Binding_Table_Buffer; // Buffer holding the shader binding table
+
+  // Shader binding table regions (one per shader stage)
+  VkStridedDeviceAddressRegionKHR Shader_Binding_Ray_Generation;  // SBT region for the ray generation shader
+  VkStridedDeviceAddressRegionKHR Shader_Binding_Miss;            // SBT region for miss shaders
+  VkStridedDeviceAddressRegionKHR Shader_Binding_Hit;             // SBT region for closest-hit shaders
+  VkStridedDeviceAddressRegionKHR Shader_Binding_Callable;        // SBT region for callable shaders (unused)
+
+  // Descriptor set
+  VkDescriptorSetLayout Descriptor_Set_Layout;  // Layout describing all 12 descriptor bindings
+  VkDescriptorPool      Descriptor_Pool;        // Pool from which the single descriptor set is allocated
+  VkDescriptorSet       Descriptor_Set;         // Descriptor set binding all resources to the pipeline
+
+  // Application state
+  int Quit;        // Non-zero when the application should exit
+  F32 Delta_Time;  // Time elapsed since the previous frame in seconds
+} Vulkan_Context;
+
+/* <<math>> ================================================================================================= */
+
+V3 V3_Make (F32 x, F32 y, F32 z) {
+  return (V3){x, y, z };
 }
 
-/* <<vkrt-fns>> ========================================================== */
-
-#define GDFN(d,T,n) (PFN_##T)vkGetDeviceProcAddr(d,#n)
-
-static RTFn rtfn_load(VkDevice dev) {
-    return (RTFn){
-        .CreateAS    = GDFN(dev,vkCreateAccelerationStructureKHR,          vkCreateAccelerationStructureKHR),
-        .DestroyAS   = GDFN(dev,vkDestroyAccelerationStructureKHR,         vkDestroyAccelerationStructureKHR),
-        .ASBuildSizes= GDFN(dev,vkGetAccelerationStructureBuildSizesKHR,   vkGetAccelerationStructureBuildSizesKHR),
-        .CmdBuildAS  = GDFN(dev,vkCmdBuildAccelerationStructuresKHR,       vkCmdBuildAccelerationStructuresKHR),
-        .ASAddr      = GDFN(dev,vkGetAccelerationStructureDeviceAddressKHR,vkGetAccelerationStructureDeviceAddressKHR),
-        .CreateRTPipe= GDFN(dev,vkCreateRayTracingPipelinesKHR,            vkCreateRayTracingPipelinesKHR),
-        .RTHandles   = GDFN(dev,vkGetRayTracingShaderGroupHandlesKHR,      vkGetRayTracingShaderGroupHandlesKHR),
-        .CmdTrace    = GDFN(dev,vkCmdTraceRaysKHR,                         vkCmdTraceRaysKHR),
-    };
+V3 V3_Add (V3 Left, V3 Right) {
+  return V3_Make (Left.x + Right.x, Left.y + Right.y, Left.z + Right.z);
 }
 
-/* <<vkutil>> ============================================================ */
-
-#define VK(f) do { VkResult _r=(f); if(_r) { fprintf(stderr,"VK %d @%d\n",_r,__LINE__); exit(1); } } while(0)
-
-static U32 vk_memtype(VkPhysicalDevice pd, U32 bits, VkMemoryPropertyFlags want) {
-    VkPhysicalDeviceMemoryProperties mp;
-    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    for (U32 i=0;i<mp.memoryTypeCount;i++)
-        if ((bits>>i&1) && (mp.memoryTypes[i].propertyFlags&want)==want) return i;
-    assert(0 && "no memtype"); return 0;
+V3 V3_Subtract (V3 Left, V3 Right) {
+  return V3_Make (Left.x - Right.x, Left.y - Right.y, Left.z - Right.z);
 }
 
-static Buf buf_alloc(VkDevice dev, VkPhysicalDevice pd, U64 sz,
-                     VkBufferUsageFlags usage, VkMemoryPropertyFlags mf) {
-    Buf b = {.sz=sz};
-    VK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size=sz, .usage=usage
-    }, NULL, &b.b));
-    VkMemoryRequirements mr;
-    vkGetBufferMemoryRequirements(dev, b.b, &mr);
-    VkMemoryAllocateFlagsInfo mafi = {
-        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-        .flags=VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
-    };
-    VK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
-        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext=(usage&VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)?&mafi:NULL,
-        .allocationSize=mr.size,
-        .memoryTypeIndex=vk_memtype(pd, mr.memoryTypeBits, mf)
-    }, NULL, &b.m));
-    VK(vkBindBufferMemory(dev, b.b, b.m, 0));
-    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
-        b.a = vkGetBufferDeviceAddress(dev, &(VkBufferDeviceAddressInfo){
-            .sType=VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer=b.b
-        });
-    return b;
+V3 V3_Scale (V3 Vector, F32 Scalar) {
+  return V3_Make (Vector.x * Scalar, Vector.y * Scalar, Vector.z * Scalar);
 }
 
-static void buf_upload(VkDevice dev, Buf b, const void *data, U64 sz) {
-    void *p; VK(vkMapMemory(dev,b.m,0,sz,0,&p));
-    memcpy(p,data,sz); vkUnmapMemory(dev,b.m);
+F32 V3_Dot (V3 Left, V3 Right) {
+  return Left.x * Right.x + Left.y * Right.y + Left.z * Right.z;
 }
 
-static Buf buf_stage_upload(VkDevice dev, VkPhysicalDevice pd,
-                             VkCommandBuffer cmd, VkQueue q,
-                             const void *data, U64 sz, VkBufferUsageFlags usage) {
-    Buf stage = buf_alloc(dev, pd, sz,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    buf_upload(dev, stage, data, sz);
-
-    Buf dst = buf_alloc(dev, pd, sz,
-        usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    VK(vkResetCommandBuffer(cmd, 0));
-    VK(vkBeginCommandBuffer(cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    vkCmdCopyBuffer(cmd, stage.b, dst.b, 1,
-        &(VkBufferCopy){.size=sz});
-    VK(vkEndCommandBuffer(cmd));
-    VK(vkQueueSubmit(q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(q));
-    vkDestroyBuffer(dev, stage.b, NULL);
-    vkFreeMemory(dev, stage.m, NULL);
-    return dst;
+V3 V3_Cross (V3 Left, V3 Right) {
+  return V3_Make (/*x =>*/ Left.y * Right.z - Left.z * Right.y,
+                  /*y =>*/ Left.z * Right.x - Left.x * Right.z,
+                  /*z =>*/ Left.x * Right.y - Left.y * Right.x);
 }
 
-static Img img_storage(VkDevice dev, VkPhysicalDevice pd, U32 w, U32 h) {
-    Img im = {.f=VK_FORMAT_R8G8B8A8_UNORM};
-    VK(vkCreateImage(dev, &(VkImageCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType=VK_IMAGE_TYPE_2D, .format=im.f,
-        .extent={w,h,1}, .mipLevels=1, .arrayLayers=1,
-        .samples=VK_SAMPLE_COUNT_1_BIT, .tiling=VK_IMAGE_TILING_OPTIMAL,
-        .usage=VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED
-    }, NULL, &im.i));
-    VkMemoryRequirements mr;
-    vkGetImageMemoryRequirements(dev, im.i, &mr);
-    VK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
-        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize=mr.size,
-        .memoryTypeIndex=vk_memtype(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-    }, NULL, &im.m));
-    VK(vkBindImageMemory(dev, im.i, im.m, 0));
-    VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image=im.i, .viewType=VK_IMAGE_VIEW_TYPE_2D, .format=im.f,
-        .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}
-    }, NULL, &im.v));
-    return im;
+V3 V3_Normalize (V3 Vector) {
+  F32 Length = sqrtf (V3_Dot (Vector, Vector));
+  return Length > 1e-6f ? V3_Scale (Vector, 1.f / Length) : Vector;
 }
 
-static void img_barrier(VkCommandBuffer cmd, VkImage img,
-                         VkImageLayout from, VkImageLayout to,
-                         VkAccessFlags src_acc, VkAccessFlags dst_acc,
-                         VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
-    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0,NULL, 0,NULL, 1,
-        &(VkImageMemoryBarrier){
-            .sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask=src_acc, .dstAccessMask=dst_acc,
-            .oldLayout=from, .newLayout=to,
-            .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
-            .image=img, .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}
-        });
+M4 M4_Identity (void) {
+  M4 Result = {0};
+  Result.Elements[0]  = 1;
+  Result.Elements[5]  = 1;
+  Result.Elements[10] = 1;
+  Result.Elements[15] = 1;
+  return Result;
 }
 
-static U32* spv_load(const char *path, U32 *out_n) {
-    FILE *f = fopen(path,"rb");
-    if (!f) { fprintf(stderr,"Cannot open %s\n",path); exit(1); }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-    U32 *buf = malloc(sz);
-    fread(buf,1,sz,f); fclose(f);
-    *out_n = (U32)sz;
-    return buf;
+/* Construct a reversed-depth perspective matrix from vertical field-of-view in degrees,
+   aspect ratio, and near/far clip distances.  The Y axis is flipped for Vulkan conventions. */
+
+M4 M4_Perspective (F32 Fovy_Degrees, F32 Aspect, F32 Near, F32 Far) {
+  F32 Focal_Length = 1.f / tanf (Fovy_Degrees * (float)M_PI / 360.f);
+
+  // Populate the matrix elements for reversed-depth Vulkan projection
+  M4 Result = {0};
+  Result.Elements[0]  = Focal_Length / Aspect;
+  Result.Elements[5]  = -Focal_Length;
+  Result.Elements[10] = Far / (Near - Far);
+  Result.Elements[11] = -1;
+  Result.Elements[14] = Near * Far / (Near - Far);
+  return Result;
 }
 
-static VkShaderModule shader_load(VkDevice dev, const char *path) {
-    U32 sz, *code = spv_load(path, &sz);
-    VkShaderModule m;
-    VK(vkCreateShaderModule(dev, &(VkShaderModuleCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize=sz, .pCode=code
-    }, NULL, &m));
-    free(code); return m;
+/* Build a view matrix from a world-space position and Euler yaw/pitch angles.
+   The forward vector points along yaw with pitch elevation; the up vector is derived
+   from the cross product of the right and forward vectors. */
+
+M4 M4_View (V3 Position, F32 Yaw, F32 Pitch) {
+  F32 Cosine_Yaw   = cosf (Yaw);
+  F32 Sine_Yaw     = sinf (Yaw);
+  F32 Cosine_Pitch = cosf (Pitch);
+  F32 Sine_Pitch   = sinf (Pitch);
+
+  // Derive the camera's orthonormal basis from yaw and pitch
+  V3 Forward = V3_Make (Sine_Yaw * Cosine_Pitch, -Sine_Pitch, -Cosine_Yaw * Cosine_Pitch);
+  V3 Right   = V3_Normalize (V3_Cross (Forward, V3_Make (0, 1, 0)));
+  V3 Up      = V3_Cross (Right, Forward);
+
+  // Populate the rotation portion of the view matrix (transposed basis)
+  M4 Result = {0};
+  Result.Elements[0]  = Right.x;
+  Result.Elements[4]  = Right.y;
+  Result.Elements[8]  = Right.z;
+  Result.Elements[1]  = Up.x;
+  Result.Elements[5]  = Up.y;
+  Result.Elements[9]  = Up.z;
+  Result.Elements[2]  = -Forward.x;
+  Result.Elements[6]  = -Forward.y;
+  Result.Elements[10] = -Forward.z;
+
+  // Compute the translation component as the negated dot of each basis vector with the position
+  Result.Elements[12] = -(Result.Elements[0] * Position.x + Result.Elements[4] * Position.y + Result.Elements[8]  * Position.z);
+  Result.Elements[13] = -(Result.Elements[1] * Position.x + Result.Elements[5] * Position.y + Result.Elements[9]  * Position.z);
+  Result.Elements[14] = -(Result.Elements[2] * Position.x + Result.Elements[6] * Position.y + Result.Elements[10] * Position.z);
+  Result.Elements[15] = 1;
+  return Result;
 }
 
-static void tex_upload_fmt(VkDevice dev, VkPhysicalDevice pd,
-                           VkCommandBuffer cmd, VkQueue q,
-                           const U8 *rgba, U32 w, U32 h, VkFormat fmt,
-                           VkImage *out_img, VkDeviceMemory *out_mem,
-                           VkImageView *out_view) {
-    VkImage img;
-    VK(vkCreateImage(dev, &(VkImageCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType=VK_IMAGE_TYPE_2D,
-        .format=fmt,
-        .extent={w,h,1}, .mipLevels=1, .arrayLayers=1,
-        .samples=VK_SAMPLE_COUNT_1_BIT, .tiling=VK_IMAGE_TILING_OPTIMAL,
-        .usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .initialLayout=VK_IMAGE_LAYOUT_UNDEFINED
-    }, NULL, &img));
-    VkMemoryRequirements mr;
-    vkGetImageMemoryRequirements(dev, img, &mr);
-    VkDeviceMemory mem;
-    VK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
-        .sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize=mr.size,
-        .memoryTypeIndex=vk_memtype(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-    }, NULL, &mem));
-    VK(vkBindImageMemory(dev, img, mem, 0));
+/* Invert an orthogonal matrix (rotation + translation only) by transposing the 3x3
+   rotation block and recomputing the translation as the negated rotated original translation. */
 
-    U64 sz = (U64)w * h * 4;
-    Buf stage = buf_alloc(dev, pd, sz,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    buf_upload(dev, stage, rgba, sz);
+M4 M4_Inverse_Orthogonal (M4 Source) {
+  M4 Result = {0};
 
-    VK(vkResetCommandBuffer(cmd, 0));
-    VK(vkBeginCommandBuffer(cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    img_barrier(cmd, img,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    vkCmdCopyBufferToImage(cmd, stage.b, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-        &(VkBufferImageCopy){
-            .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
-            .imageExtent={w,h,1}
-        });
-    img_barrier(cmd, img,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-    VK(vkEndCommandBuffer(cmd));
-    VK(vkQueueSubmit(q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(q));
-    vkDestroyBuffer(dev, stage.b, NULL);
-    vkFreeMemory(dev, stage.m, NULL);
+  // Transpose the upper-left 3x3 rotation block
+  for (int Row = 0; Row < 3; Row++)
+    for (int Column = 0; Column < 3; Column++)
+      Result.Elements[Row * 4 + Column] = Source.Elements[Column * 4 + Row];
 
-    VkImageView view;
-    VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image=img, .viewType=VK_IMAGE_VIEW_TYPE_2D,
-        .format=fmt,
-        .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}
-    }, NULL, &view));
-
-    *out_img = img; *out_mem = mem; *out_view = view;
+  // Recompute translation as the negated product of the transposed rotation and the original translation
+  Result.Elements[12] = -(Result.Elements[0]  * Source.Elements[12] + Result.Elements[4]  * Source.Elements[13] + Result.Elements[8]  * Source.Elements[14]);
+  Result.Elements[13] = -(Result.Elements[1]  * Source.Elements[12] + Result.Elements[5]  * Source.Elements[13] + Result.Elements[9]  * Source.Elements[14]);
+  Result.Elements[14] = -(Result.Elements[2]  * Source.Elements[12] + Result.Elements[6]  * Source.Elements[13] + Result.Elements[10] * Source.Elements[14]);
+  Result.Elements[15] = 1;
+  return Result;
 }
 
-static void tex_upload(VkDevice dev, VkPhysicalDevice pd,
-                       VkCommandBuffer cmd, VkQueue q,
-                       const U8 *rgba, U32 w, U32 h,
-                       VkImage *out_img, VkDeviceMemory *out_mem,
-                       VkImageView *out_view) {
-    tex_upload_fmt(dev, pd, cmd, q, rgba, w, h,
-                   VK_FORMAT_R8G8B8A8_SRGB, out_img, out_mem, out_view);
+/* Analytically invert a perspective projection matrix by exploiting its known sparse structure.
+   Only the non-zero elements are inverted; all others remain zero. */
+
+M4 M4_Inverse_Projection (M4 Projection) {
+  M4 Result = {0};
+  Result.Elements[0]  = 1.f / Projection.Elements[0];
+  Result.Elements[5]  = 1.f / Projection.Elements[5];
+  Result.Elements[11] = 1.f / Projection.Elements[14];
+  Result.Elements[14] = 1.f / Projection.Elements[11];
+  Result.Elements[15] = -Projection.Elements[10] / (Projection.Elements[11] * Projection.Elements[14]);
+  return Result;
 }
 
-static VkSampler sampler_create(VkDevice dev) {
-    VkSampler s;
-    VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter=VK_FILTER_LINEAR, .minFilter=VK_FILTER_LINEAR,
-        .addressModeU=VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV=VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeW=VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .maxLod=1.f
-    }, NULL, &s));
-    return s;
+/* <<vulkan_raytracing_functions>> ========================================================================== */
+
+#define DEVICE_PROC(Device, Type, Name) (PFN_##Type)vkGetDeviceProcAddr (Device, #Name)
+
+/* Load all ray tracing extension function pointers from the logical device.  These are not part of
+   the Vulkan core and must be resolved at runtime via vkGetDeviceProcAddr. */
+
+Raytracing_Functions Raytracing_Functions_Load (VkDevice Device) {
+  return (Raytracing_Functions){
+    .Create_Acceleration_Structure  = DEVICE_PROC (Device, vkCreateAccelerationStructureKHR,              vkCreateAccelerationStructureKHR),
+    .Destroy_Acceleration_Structure = DEVICE_PROC (Device, vkDestroyAccelerationStructureKHR,             vkDestroyAccelerationStructureKHR),
+    .Get_Build_Sizes                = DEVICE_PROC (Device, vkGetAccelerationStructureBuildSizesKHR,       vkGetAccelerationStructureBuildSizesKHR),
+    .Command_Build                  = DEVICE_PROC (Device, vkCmdBuildAccelerationStructuresKHR,           vkCmdBuildAccelerationStructuresKHR),
+    .Get_Device_Address             = DEVICE_PROC (Device, vkGetAccelerationStructureDeviceAddressKHR,    vkGetAccelerationStructureDeviceAddressKHR),
+    .Create_Pipeline                = DEVICE_PROC (Device, vkCreateRayTracingPipelinesKHR,                vkCreateRayTracingPipelinesKHR),
+    .Get_Shader_Group_Handles       = DEVICE_PROC (Device, vkGetRayTracingShaderGroupHandlesKHR,         vkGetRayTracingShaderGroupHandlesKHR),
+    .Command_Trace_Rays             = DEVICE_PROC (Device, vkCmdTraceRaysKHR,                            vkCmdTraceRaysKHR),
+  };
 }
 
-static VkSampler sampler_clamp_create(VkDevice dev) {
-    VkSampler s;
-    VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter=VK_FILTER_LINEAR, .minFilter=VK_FILTER_LINEAR,
-        .addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .maxLod=1.f
-    }, NULL, &s));
-    return s;
+/* <<vulkan_utilities>> ===================================================================================== */
+
+#define VK_CHECK(Function_Call)                                                                               \
+  do {                                                                                                       \
+    VkResult Vulkan_Result = (Function_Call);                                                                  \
+    if (Vulkan_Result) {                                                                                     \
+      fprintf (stderr, "VK %d @%d\n", Vulkan_Result, __LINE__);                                               \
+      exit (1);                                                                                               \
+    }                                                                                                         \
+  } while (0)
+
+/* Search the physical device's memory heaps for a memory type index that satisfies both the
+   type bitmask (from memory requirements) and the desired property flags (host-visible, device-local, etc). */
+
+U32 Find_Memory_Type (VkPhysicalDevice Physical_Device, U32 Type_Bits, VkMemoryPropertyFlags Desired_Properties) {
+  VkPhysicalDeviceMemoryProperties Memory_Properties;
+  vkGetPhysicalDeviceMemoryProperties (Physical_Device, &Memory_Properties);
+
+  // Test each memory type against the required bits and desired property flags
+  for (U32 Index = 0; Index < Memory_Properties.memoryTypeCount; Index++) {
+    if ((Type_Bits >> Index & 1) and (Memory_Properties.memoryTypes[Index].propertyFlags & Desired_Properties) == Desired_Properties)
+      return Index;
+  }
+
+  // No matching memory type found (should be unreachable on a conformant driver)
+  assert (0 and "no matching memory type");
+  return 0;
 }
 
-/* <<tga-loader>> ======================================================== */
+/* Allocate a GPU buffer with the given size, usage flags, and memory properties.  If the usage includes
+   shader device address, the allocation is flagged accordingly and the device address is queried. */
 
-static U8* tga_load(const char *path, U32 *w, U32 *h) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f,0,SEEK_END); long len=ftell(f); rewind(f);
-    if (len < 18) { fclose(f); return NULL; }
-    U8 *raw = malloc(len); fread(raw,1,len,f); fclose(f);
-    U8 *p = raw, *end = raw + len;
+Gpu_Buffer Buffer_Allocate (VkDevice Device, VkPhysicalDevice Physical_Device, U64 Size,
+                                   VkBufferUsageFlags Usage, VkMemoryPropertyFlags Memory_Flags) {
+  Gpu_Buffer Result = {.Size = Size };
 
-    U8 id_len = p[0], cmap_type = p[1], img_type = p[2];
-    U16 width, height; memcpy(&width, p+12, 2); memcpy(&height, p+14, 2);
-    U8 bpp = p[16];
-    (void)cmap_type;
-    p += 18 + id_len;
+  // Create the buffer object with the requested size and usage
+  VK_CHECK (vkCreateBuffer (/*device      =>*/ Device,
+                            /*pCreateInfo =>*/ &(VkBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size  = Size,
+      .usage = Usage,
+    },
+                            /*pAllocator  =>*/ NULL,
+                            /*pBuffer     =>*/ &Result.Buffer));
 
-    if (img_type != 2 && img_type != 3 && img_type != 10) {
-        free(raw); return NULL;
+  // Query how much memory this buffer actually requires and which memory types are compatible
+  VkMemoryRequirements Memory_Requirements;
+  vkGetBufferMemoryRequirements (Device, Result.Buffer, &Memory_Requirements);
+
+  // If the buffer needs a device address, pass the device-address allocation flag
+  VkMemoryAllocateFlagsInfo Allocate_Flags = {
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+  };
+
+  // Allocate device memory from the appropriate heap
+  VK_CHECK (vkAllocateMemory (/*device        =>*/ Device,
+                              /*pAllocateInfo =>*/ &(VkMemoryAllocateInfo){
+      .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext           = (Usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ? &Allocate_Flags : NULL,
+      .allocationSize  = Memory_Requirements.size,
+      .memoryTypeIndex = Find_Memory_Type (Physical_Device, Memory_Requirements.memoryTypeBits, Memory_Flags),
+    },
+                              /*pAllocator    =>*/ NULL,
+                              /*pMemory       =>*/ &Result.Memory));
+
+  // Bind the allocated memory to the buffer
+  VK_CHECK (vkBindBufferMemory (Device, Result.Buffer, Result.Memory, 0));
+
+  // Retrieve the 64-bit device address if this buffer will be referenced from shaders
+  if (Usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    Result.Address = vkGetBufferDeviceAddress (/*device =>*/ Device,
+                                               /*pInfo  =>*/ &(VkBufferDeviceAddressInfo){
+        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = Result.Buffer,
+      });
+
+  return Result;
+}
+
+/* Map the buffer's device memory into host address space, copy the source data, then unmap. */
+
+void Buffer_Upload (VkDevice Device, Gpu_Buffer Destination, const void *Data, U64 Size) {
+  void *Mapped;
+  VK_CHECK (vkMapMemory (Device, Destination.Memory, 0, Size, 0, &Mapped));
+  memcpy (Mapped, Data, Size);
+  vkUnmapMemory (Device, Destination.Memory);
+}
+
+/* Upload data to device-local memory via a host-visible staging buffer.  A one-shot command buffer
+   performs the copy, then the staging buffer is freed.  The resulting buffer has the requested usage
+   flags plus transfer-destination and shader-device-address. */
+
+Gpu_Buffer Buffer_Stage_Upload (VkDevice Device, VkPhysicalDevice Physical_Device,
+                                       VkCommandBuffer Command_Buffer, VkQueue Queue,
+                                       const void *Data, U64 Size, VkBufferUsageFlags Usage) {
+
+  // Allocate a host-visible staging buffer and fill it with the source data
+  Gpu_Buffer Staging = Buffer_Allocate (/*Device          =>*/ Device,
+                                        /*Physical_Device =>*/ Physical_Device,
+                                        /*Size            =>*/ Size,
+                                        /*Usage           =>*/ VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                        /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  Buffer_Upload (Device, Staging, Data, Size);
+
+  // Allocate the final device-local buffer that shaders will access
+  Gpu_Buffer Destination = Buffer_Allocate (/*Device          =>*/ Device,
+                                            /*Physical_Device =>*/ Physical_Device,
+                                            /*Size            =>*/ Size,
+                                            /*Usage           =>*/ Usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                            /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Record and submit a one-shot command buffer to copy staging to destination
+  VK_CHECK (vkResetCommandBuffer (Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    }));
+
+  // Record the copy command from staging to destination
+  vkCmdCopyBuffer (Command_Buffer, Staging.Buffer, Destination.Buffer, 1, &(VkBufferCopy){.size = Size });
+
+  // End recording, submit the command buffer, and wait for the transfer to finish
+  VK_CHECK (vkEndCommandBuffer (Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+      .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers    = &Command_Buffer,
+    },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Queue));
+
+  // Release the temporary staging buffer now that the transfer is complete
+  vkDestroyBuffer (Device, Staging.Buffer, NULL);
+  vkFreeMemory (Device, Staging.Memory, NULL);
+  return Destination;
+}
+
+/* Create a device-local 2D image suitable for use as a ray tracing storage target.
+   The image is RGBA8 UNORM with storage and transfer-source usage bits. */
+
+Gpu_Image Image_Storage_Create (VkDevice Device, VkPhysicalDevice Physical_Device, U32 Width, U32 Height) {
+  Gpu_Image Result = {.Format = VK_FORMAT_R8G8B8A8_UNORM };
+
+  // Create the image object with storage and transfer-source usage
+  VK_CHECK (vkCreateImage (/*device      =>*/ Device,
+                           /*pCreateInfo =>*/ &(VkImageCreateInfo){
+      .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType     = VK_IMAGE_TYPE_2D,
+      .format        = Result.Format,
+      .extent        = {Width, Height, 1 },
+      .mipLevels     = 1,
+      .arrayLayers   = 1,
+      .samples       = VK_SAMPLE_COUNT_1_BIT,
+      .tiling        = VK_IMAGE_TILING_OPTIMAL,
+      .usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    },
+                           /*pAllocator  =>*/ NULL,
+                           /*pImage      =>*/ &Result.Image));
+
+  // Query memory requirements and allocate device-local memory for the image
+  VkMemoryRequirements Memory_Requirements;
+  vkGetImageMemoryRequirements (Device, Result.Image, &Memory_Requirements);
+
+  // Allocate device-local memory and bind it to the image
+  VK_CHECK (vkAllocateMemory (/*device        =>*/ Device,
+                              /*pAllocateInfo =>*/ &(VkMemoryAllocateInfo){
+      .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize  = Memory_Requirements.size,
+      .memoryTypeIndex = Find_Memory_Type (Physical_Device, Memory_Requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    },
+                              /*pAllocator    =>*/ NULL,
+                              /*pMemory       =>*/ &Result.Memory));
+
+  VK_CHECK (vkBindImageMemory (Device, Result.Image, Result.Memory, 0));
+
+  // Create an image view so shaders can reference this image
+  VK_CHECK (vkCreateImageView (/*device      =>*/ Device,
+                               /*pCreateInfo =>*/ &(VkImageViewCreateInfo){
+      .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image            = Result.Image,
+      .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+      .format           = Result.Format,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    },
+                               /*pAllocator  =>*/ NULL,
+                               /*pView       =>*/ &Result.View));
+
+  return Result;
+}
+
+/* Insert a pipeline barrier that transitions an image between layouts, specifying the
+   source and destination access masks and pipeline stages for proper synchronization. */
+
+void Image_Layout_Barrier (VkCommandBuffer Command_Buffer, VkImage Image,
+                                  VkImageLayout Old_Layout, VkImageLayout New_Layout,
+                                  VkAccessFlags Source_Access, VkAccessFlags Destination_Access,
+                                  VkPipelineStageFlags Source_Stage, VkPipelineStageFlags Destination_Stage) {
+  vkCmdPipelineBarrier (/*commandBuffer            =>*/ Command_Buffer,
+                        /*srcStageMask             =>*/ Source_Stage,
+                        /*dstStageMask             =>*/ Destination_Stage,
+                        /*dependencyFlags          =>*/ 0,
+                        /*memoryBarrierCount       =>*/ 0,
+                        /*pMemoryBarriers          =>*/ NULL,
+                        /*bufferMemoryBarrierCount =>*/ 0,
+                        /*pBufferMemoryBarriers    =>*/ NULL,
+                        /*imageMemoryBarrierCount  =>*/ 1,
+                        /*pImageMemoryBarriers     =>*/ &(VkImageMemoryBarrier){
+                            .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                            .srcAccessMask       = Source_Access,
+                            .dstAccessMask       = Destination_Access,
+                            .oldLayout           = Old_Layout,
+                            .newLayout           = New_Layout,
+                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                            .image               = Image,
+                            .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+                          });
+}
+
+/* Read a SPIR-V binary file from disk into a heap-allocated buffer.  Returns the raw U32
+   code pointer and writes the byte size to Out_Size. */
+
+U32 *Spirv_Load (const char *Path, U32 *Out_Size) {
+  FILE *File = fopen (Path, "rb");
+  if (not File) {fprintf (stderr, "Cannot open %s\n", Path); exit (1); }
+
+  // Read the file contents into a heap-allocated buffer
+  fseek (File, 0, SEEK_END);
+  long Size = ftell (File);
+  rewind (File);
+
+  // Allocate a buffer and read the SPIR-V bytecode
+  U32 *Code = malloc (Size);
+  fread (Code, 1, Size, File);
+  fclose (File);
+
+  // Return the bytecode pointer and its size
+  *Out_Size = (U32)Size;
+  return Code;
+}
+
+/* Load a SPIR-V file and wrap it in a Vulkan shader module. */
+
+VkShaderModule Shader_Module_Load (VkDevice Device, const char *Path) {
+  U32 Size;
+  U32 *Code = Spirv_Load (Path, &Size);
+
+  // Wrap the raw SPIR-V code in a Vulkan shader module
+  VkShaderModule Module;
+  VK_CHECK (vkCreateShaderModule (/*device        =>*/ Device,
+                                  /*pCreateInfo   =>*/ &(VkShaderModuleCreateInfo){
+                                      .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                      .codeSize = Size,
+                                      .pCode    = Code,
+                                    },
+                                  /*pAllocator    =>*/ NULL,
+                                  /*pShaderModule =>*/ &Module));
+
+  free (Code);
+  return Module;
+}
+
+/* Upload raw RGBA pixel data to a device-local texture image via staging buffer,
+   transitioning the image layout from undefined through transfer-destination to shader-read-only.
+   The caller specifies the Vulkan format (SRGB vs UNORM). */
+
+void Texture_Upload_With_Format (VkDevice Device, VkPhysicalDevice Physical_Device,
+                                        VkCommandBuffer Command_Buffer, VkQueue Queue,
+                                        const U8 *Pixels, U32 Width, U32 Height, VkFormat Format,
+                                        VkImage *Out_Image, VkDeviceMemory *Out_Memory, VkImageView *Out_View) {
+
+  // Create the texture image with sampled and transfer-destination usage
+  VkImage Image;
+  VK_CHECK (vkCreateImage (/*device      =>*/ Device,
+                           /*pCreateInfo =>*/ &(VkImageCreateInfo){
+      .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType     = VK_IMAGE_TYPE_2D,
+      .format        = Format,
+      .extent        = {Width, Height, 1 },
+      .mipLevels     = 1,
+      .arrayLayers   = 1,
+      .samples       = VK_SAMPLE_COUNT_1_BIT,
+      .tiling        = VK_IMAGE_TILING_OPTIMAL,
+      .usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    },
+                           /*pAllocator  =>*/ NULL,
+                           /*pImage      =>*/ &Image));
+
+  // Allocate and bind device-local memory for the texture
+  VkMemoryRequirements Memory_Requirements;
+  vkGetImageMemoryRequirements (Device, Image, &Memory_Requirements);
+
+  // Allocate device-local memory for the texture
+  VkDeviceMemory Memory;
+  VK_CHECK (vkAllocateMemory (/*device        =>*/ Device,
+                              /*pAllocateInfo =>*/ &(VkMemoryAllocateInfo){
+      .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize  = Memory_Requirements.size,
+      .memoryTypeIndex = Find_Memory_Type (Physical_Device, Memory_Requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    },
+                              /*pAllocator    =>*/ NULL,
+                              /*pMemory       =>*/ &Memory));
+  VK_CHECK (vkBindImageMemory (Device, Image, Memory, 0));
+
+  // Stage the pixel data through a host-visible buffer
+  U64 Byte_Size = (U64)Width * Height * 4;
+  Gpu_Buffer Staging = Buffer_Allocate (/*Device          =>*/ Device,
+                                        /*Physical_Device =>*/ Physical_Device,
+                                        /*Size            =>*/ Byte_Size,
+                                        /*Usage           =>*/ VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                        /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  Buffer_Upload (Device, Staging, Pixels, Byte_Size);
+
+  // Record a command buffer that transitions the image and copies the staging data into it
+  VK_CHECK (vkResetCommandBuffer (Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    }));
+
+  // Transition from undefined to transfer-destination for the copy
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Command_Buffer,
+                        /*Image              =>*/ Image,
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_UNDEFINED,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        /*Source_Access      =>*/ 0,
+                        /*Destination_Access =>*/ VK_ACCESS_TRANSFER_WRITE_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+  // Copy the staging buffer contents into the image
+  vkCmdCopyBufferToImage (/*commandBuffer  =>*/ Command_Buffer,
+                          /*srcBuffer      =>*/ Staging.Buffer,
+                          /*dstImage       =>*/ Image,
+                          /*dstImageLayout =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          /*regionCount    =>*/ 1,
+                          /*pRegions       =>*/ &(VkBufferImageCopy){
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      .imageExtent      = {Width, Height, 1 },
+    });
+
+  // Transition from transfer-destination to shader-read-only for sampling in ray tracing shaders
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Command_Buffer,
+                        /*Image              =>*/ Image,
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        /*Source_Access      =>*/ VK_ACCESS_TRANSFER_WRITE_BIT,
+                        /*Destination_Access =>*/ VK_ACCESS_SHADER_READ_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+
+  // Submit the command buffer and wait for the transfer to complete
+  VK_CHECK (vkEndCommandBuffer (Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+      .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers    = &Command_Buffer,
+    },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Queue));
+
+  // Release the staging buffer
+  vkDestroyBuffer (Device, Staging.Buffer, NULL);
+  vkFreeMemory (Device, Staging.Memory, NULL);
+
+  // Create an image view for shader access
+  VkImageView View;
+  VK_CHECK (vkCreateImageView (/*device      =>*/ Device,
+                               /*pCreateInfo =>*/ &(VkImageViewCreateInfo){
+      .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image            = Image,
+      .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+      .format           = Format,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    },
+                               /*pAllocator  =>*/ NULL,
+                               /*pView       =>*/ &View));
+
+  *Out_Image  = Image;
+  *Out_Memory = Memory;
+  *Out_View   = View;
+}
+
+/* Convenience wrapper that uploads a texture as SRGB. */
+
+void Texture_Upload (VkDevice Device, VkPhysicalDevice Physical_Device,
+                            VkCommandBuffer Command_Buffer, VkQueue Queue,
+                            const U8 *Pixels, U32 Width, U32 Height,
+                            VkImage *Out_Image, VkDeviceMemory *Out_Memory, VkImageView *Out_View) {
+  Texture_Upload_With_Format (/*Device          =>*/ Device,
+                              /*Physical_Device =>*/ Physical_Device,
+                              /*Command_Buffer  =>*/ Command_Buffer,
+                              /*Queue           =>*/ Queue,
+                              /*Pixels          =>*/ Pixels,
+                              /*Width           =>*/ Width,
+                              /*Height          =>*/ Height,
+                              /*Format          =>*/ VK_FORMAT_R8G8B8A8_SRGB,
+                              /*Out_Image       =>*/ Out_Image,
+                              /*Out_Memory      =>*/ Out_Memory,
+                              /*Out_View        =>*/ Out_View);
+}
+
+/* Create a sampler with linear filtering and repeating address mode on all axes. */
+
+VkSampler Sampler_Create_Repeating (VkDevice Device) {
+  VkSampler Sampler;
+  VK_CHECK (vkCreateSampler (/*device      =>*/ Device,
+                             /*pCreateInfo =>*/ &(VkSamplerCreateInfo){
+      .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter    = VK_FILTER_LINEAR,
+      .minFilter    = VK_FILTER_LINEAR,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+      .maxLod       = 1.f,
+    },
+                             /*pAllocator  =>*/ NULL,
+                             /*pSampler    =>*/ &Sampler));
+  return Sampler;
+}
+
+/* Create a sampler with linear filtering and clamp-to-edge on all axes. */
+
+VkSampler Sampler_Create_Clamping (VkDevice Device) {
+  VkSampler Sampler;
+  VK_CHECK (vkCreateSampler (/*device      =>*/ Device,
+                             /*pCreateInfo =>*/ &(VkSamplerCreateInfo){
+      .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .magFilter    = VK_FILTER_LINEAR,
+      .minFilter    = VK_FILTER_LINEAR,
+      .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+      .maxLod       = 1.f,
+    },
+                             /*pAllocator  =>*/ NULL,
+                             /*pSampler    =>*/ &Sampler));
+  return Sampler;
+}
+
+/* <<tga_loader>> ======================================================================================= */
+
+/* Load a TGA image file and decode it into RGBA8 pixel data.  Supports uncompressed
+   8/24/32-bit images (type 2/3) and RLE-compressed true-color images (type 10).
+   The output is always bottom-to-top, RGBA, 8 bits per channel. */
+
+U8 *Tga_Load (const char *Path, U32 *Out_Width, U32 *Out_Height) {
+  FILE *File = fopen (Path, "rb");
+  if (not File) return NULL;
+
+  // Read the entire file into memory
+  fseek (File, 0, SEEK_END);
+  long Length = ftell (File);
+  rewind (File);
+  if (Length < 18) {fclose (File); return NULL; }
+
+  // Allocate a buffer and read the entire file into memory
+  U8 *Raw = malloc (Length);
+  fread (Raw, 1, Length, File);
+  fclose (File);
+
+  // Parse the 18-byte TGA header fields
+  U8 *Cursor     = Raw;
+  U8 *End_Cursor = Raw + Length;
+
+  // Extract the 18-byte TGA header fields
+  U8  Id_Length     = Cursor[0];
+  U8  Colormap_Type = Cursor[1];
+  U8  Image_Type    = Cursor[2];
+  U16 Image_Width, Image_Height;
+  memcpy (&Image_Width,  Cursor + 12, 2);
+  memcpy (&Image_Height, Cursor + 14, 2);
+  U8  Bits_Per_Pixel = Cursor[16];
+  (void)Colormap_Type;
+  Cursor += 18 + Id_Length;
+
+  // Reject unsupported image types (only uncompressed and RLE true-color are handled)
+  if (Image_Type != 2 and Image_Type != 3 and Image_Type != 10) {
+    free (Raw);
+    return NULL;
+  }
+
+  // Allocate the output RGBA pixel buffer
+  U32 Columns = Image_Width;
+  U32 Rows    = Image_Height;
+  *Out_Width  = Columns;
+  *Out_Height = Rows;
+  U8 *Output  = malloc (Columns * Rows * 4);
+
+  // Decode uncompressed image data (types 2 and 3), reading rows bottom-to-top
+  if (Image_Type == 2 or Image_Type == 3) {
+    for (U32 Row = Rows; Row-- > 0; ) {
+      U8 *Destination = Output + Row * Columns * 4;
+      for (U32 Column = 0; Column < Columns; Column++) {
+        if (Cursor >= End_Cursor) break;
+        U8 Red, Green, Blue, Alpha = 255;
+        if (Bits_Per_Pixel == 8) {
+          Blue = *Cursor++;
+          Red = Green = Blue;
+        } else if (Bits_Per_Pixel == 24) {
+          Blue  = *Cursor++;
+          Green = *Cursor++;
+          Red   = *Cursor++;
+        } else {
+          Blue  = *Cursor++;
+          Green = *Cursor++;
+          Red   = *Cursor++;
+          Alpha = *Cursor++;
+        }
+        *Destination++ = Red;
+        *Destination++ = Green;
+        *Destination++ = Blue;
+        *Destination++ = Alpha;
+      }
     }
-    U32 cols = width, rows = height;
-    *w = cols; *h = rows;
-    U8 *out = malloc(cols * rows * 4);
 
-    if (img_type == 2 || img_type == 3) {
-        for (U32 row = rows; row-- > 0; ) {
-            U8 *dst = out + row * cols * 4;
-            for (U32 col = 0; col < cols; col++) {
-                if (p >= end) break;
-                U8 r,g,b,a=255;
-                if (bpp == 8)       { b=*p++; r=g=b; }
-                else if (bpp == 24) { b=*p++; g=*p++; r=*p++; }
-                else                { b=*p++; g=*p++; r=*p++; a=*p++; }
-                *dst++=r; *dst++=g; *dst++=b; *dst++=a;
-            }
+  // Decode RLE-compressed image data (type 10)
+  } else {
+    U32 Row = Rows - 1, Column = 0;
+    U8 *Destination = Output + Row * Columns * 4;
+    while (Cursor < End_Cursor and Row < Rows) {
+
+      // Read the RLE packet header: high bit indicates a run-length packet
+      U8 Header      = *Cursor++;
+      U8 Pixel_Count = (Header & 0x7F) + 1;
+
+      // Dispatch on packet type: run-length or raw
+      if (Header & 0x80) {
+
+        // Run-length packet: one pixel value repeated Pixel_Count times
+        U8 Blue = 0, Green = 0, Red = 0, Alpha = 255;
+        if (Bits_Per_Pixel == 24) {
+          Blue = *Cursor++; Green = *Cursor++; Red = *Cursor++;
+        } else {
+          Blue = *Cursor++; Green = *Cursor++; Red = *Cursor++; Alpha = *Cursor++;
         }
-    } else { /* RLE (type 10) */
-        U32 row = rows - 1, col = 0;
-        U8 *dst = out + row * cols * 4;
-        while (p < end && row < rows) {
-            U8 hdr = *p++, cnt = (hdr & 0x7F) + 1;
-            if (hdr & 0x80) { /* run-length */
-                U8 b=0,g=0,r=0,a=255;
-                if (bpp==24) { b=*p++; g=*p++; r=*p++; }
-                else         { b=*p++; g=*p++; r=*p++; a=*p++; }
-                for (U8 j=0;j<cnt;j++) {
-                    *dst++=r; *dst++=g; *dst++=b; *dst++=a;
-                    if (++col == cols) {
-                        col = 0;
-                        if (row == 0) goto done;
-                        row--; dst = out + row * cols * 4;
-                    }
-                }
-            } else { /* raw */
-                for (U8 j=0;j<cnt;j++) {
-                    U8 b=0,g=0,r=0,a=255;
-                    if (bpp==24) { b=*p++; g=*p++; r=*p++; }
-                    else         { b=*p++; g=*p++; r=*p++; a=*p++; }
-                    *dst++=r; *dst++=g; *dst++=b; *dst++=a;
-                    if (++col == cols) {
-                        col = 0;
-                        if (row == 0) goto done;
-                        row--; dst = out + row * cols * 4;
-                    }
-                }
-            }
+        for (U8 Pixel = 0; Pixel < Pixel_Count; Pixel++) {
+          *Destination++ = Red;
+          *Destination++ = Green;
+          *Destination++ = Blue;
+          *Destination++ = Alpha;
+          if (++Column == Columns) {
+            Column = 0;
+            if (Row == 0) goto Tga_Done;
+            Row--;
+            Destination = Output + Row * Columns * 4;
+          }
         }
-        done:;
+
+      // Raw packet: Pixel_Count distinct pixel values follow
+      } else {
+        for (U8 Pixel = 0; Pixel < Pixel_Count; Pixel++) {
+          U8 Blue = 0, Green = 0, Red = 0, Alpha = 255;
+          if (Bits_Per_Pixel == 24) {
+            Blue = *Cursor++; Green = *Cursor++; Red = *Cursor++;
+          } else {
+            Blue = *Cursor++; Green = *Cursor++; Red = *Cursor++; Alpha = *Cursor++;
+          }
+          *Destination++ = Red;
+          *Destination++ = Green;
+          *Destination++ = Blue;
+          *Destination++ = Alpha;
+          if (++Column == Columns) {
+            Column = 0;
+            if (Row == 0) goto Tga_Done;
+            Row--;
+            Destination = Output + Row * Columns * 4;
+          }
+        }
+      }
     }
-    free(raw);
-    return out;
+    Tga_Done:;
+  }
+
+  free (Raw);
+  return Output;
 }
 
-/* <<md3-loader>> ======================================================== */
+/* <<md3_loader>> ======================================================================================= */
 
-#define MD3_MAGIC 0x33504449u  /* "IDP3" */
+#define MD3_MAGIC 0x33504449u
 
-typedef struct { I32 magic; char name[64]; I32 flags;
-                 I32 n_frames, n_shaders, n_verts, n_tris;
-                 I32 ofs_tris, ofs_shaders, ofs_st, ofs_verts, ofs_end; } MD3Surf;
-typedef struct { char name[64]; F32 origin[3]; F32 axis[9]; } MD3Tag;
-
+// MD3 surface header: describes one mesh within an MD3 model file
 typedef struct {
-    Vtx *verts; U32 nv; U32 *idxs; U32 ni; U32 *tex_ids; U32 ntri;
-    F32  tag_barrel[12]; /* origin(3)+axis(9) from body */
-    F32  tag_wpn[30][12]; U32 n_anim_frames; /* tag_weapon from hand */
-    char tex_name[3][64]; U32 n_surfaces;
-} Weapon;
+  I32 Magic;                              // Surface magic identifier (always IDP3)
+  char Name[64];                          // Null-terminated surface name
+  I32 Flags;                              // Surface flags (unused in Quake 3)
+  I32 Number_Of_Frames, Number_Of_Shaders;    // Animation frame count and attached shader count
+  I32 Number_Of_Vertices, Number_Of_Triangles; // Per-frame vertex count and triangle count
+  I32 Triangles_Offset, Shaders_Offset;   // Byte offsets from surface start to triangle and shader data
+  I32 Texture_Coordinates_Offset;         // Byte offset to the per-vertex texture coordinate array
+  I32 Vertices_Offset, End_Offset;        // Byte offset to compressed vertex frames and to the next surface
+} Md3_Surface;
 
+// MD3 tag: a named attachment point with position and orientation for linking model parts
 typedef struct {
-    Weapon mdl; Vtx *xverts;
-    int firing; F32 fire_t, bob_t;
-    Buf vbuf, ibuf, tid_buf; AS blas;
-    Buf blas_scratch;
-    U32 wpn_tex_base;
-} Wpn;
+  char Name[64];    // Null-terminated tag name (e.g. "tag_barrel", "tag_weapon")
+  F32  Origin[3];   // World-space position of the attachment point
+  F32  Axis[9];     // 3x3 rotation matrix (row-major) defining the tag's local coordinate frame
+} Md3_Tag;
 
-static void md3_parse_surface(const U8 *sdata, Vtx **pv, U32 *pnv,
-                               U32 **pi, U32 *pni, U32 **ptid, U32 *pntri,
-                               U32 tex_idx, const F32 *xform) {
-    const MD3Surf *s = (const MD3Surf*)sdata;
-    U32 base_v = *pnv;
-    /* indices */
-    const I32 *tris = (const I32*)(sdata + s->ofs_tris);
-    *pi = realloc(*pi, sizeof(U32)*(*pni + s->n_tris*3));
-    for (I32 i = 0; i < s->n_tris*3; i++)
-        (*pi)[*pni + i] = base_v + (U32)tris[i];
-    /* tex_ids */
-    *ptid = realloc(*ptid, sizeof(U32)*(*pntri + s->n_tris));
-    for (I32 i = 0; i < s->n_tris; i++)
-        (*ptid)[*pntri + i] = tex_idx;
-    /* vertices: packed as I16 xyz + U8 normal(lat/lng) */
-    const U8 *vdata = sdata + s->ofs_verts; /* frame 0 */
-    const F32 *stdata = (const F32*)(sdata + s->ofs_st);
-    *pv = realloc(*pv, sizeof(Vtx)*(*pnv + s->n_verts));
-    for (I32 i = 0; i < s->n_verts; i++) {
-        const I16 *xyz = (const I16*)(vdata + i*8);
-        F32 px = xyz[0] / 64.f, py = xyz[1] / 64.f, pz = xyz[2] / 64.f;
-        /* decode packed normal (lat/lng in 2 bytes) */
-        U8 lat = vdata[i*8+6], lng = vdata[i*8+7];
-        F32 la = lat * (2.f*(F32)M_PI/255.f), lo = lng * (2.f*(F32)M_PI/255.f);
-        F32 nx = cosf(la)*sinf(lo), ny = sinf(la)*sinf(lo), nz = cosf(lo);
-        /* optional transform (tag_barrel pre-transform) */
-        if (xform) {
-            F32 ox=xform[0],oy=xform[1],oz=xform[2];
-            F32 tx = xform[3]*px + xform[6]*py + xform[9]*pz  + ox;
-            F32 ty = xform[4]*px + xform[7]*py + xform[10]*pz + oy;
-            F32 tz = xform[5]*px + xform[8]*py + xform[11]*pz + oz;
-            F32 tnx = xform[3]*nx + xform[6]*ny + xform[9]*nz;
-            F32 tny = xform[4]*nx + xform[7]*ny + xform[10]*nz;
-            F32 tnz = xform[5]*nx + xform[8]*ny + xform[11]*nz;
-            px=tx; py=ty; pz=tz; nx=tnx; ny=tny; nz=tnz;
+// Parsed weapon model assembled from multiple MD3 surfaces (body, barrel, hand)
+typedef struct {
+  Vertex *Vertices;       U32 Vertex_Count;     // Merged vertex array from all surfaces
+  U32    *Indices;        U32 Index_Count;       // Merged index array from all surfaces
+  U32    *Texture_Ids;    U32 Triangle_Count;    // Per-triangle texture index and total triangle count
+  F32     Tag_Barrel[12];                        // Barrel attachment transform: origin[3] + axis[9]
+  F32     Tag_Weapon[30][12];                    // Per-frame weapon tag transforms (up to 30 animation frames)
+  U32     Animation_Frame_Count;                 // Number of valid frames in the Tag_Weapon array
+  char    Texture_Names[3][64];                  // Texture path for each surface (body, barrel, hand)
+  U32     Surface_Count;                         // Number of surfaces composing this weapon (typically 3)
+} Weapon_Model;
+
+// Runtime weapon state combining the model data with per-frame animation and GPU resources
+typedef struct {
+  Weapon_Model           Model;                 // Parsed model geometry and attachment tags
+  Vertex                *Transformed_Vertices;  // Scratch buffer for CPU-side per-frame vertex transformation
+  int                    Is_Firing;             // Non-zero while the fire button is held
+  F32                    Fire_Time, Bob_Time;   // Recoil decay timer and idle bob phase accumulator
+  Gpu_Buffer             Vertex_Buffer, Index_Buffer, Texture_Id_Buffer;  // GPU buffers for weapon geometry
+  Acceleration_Structure Bottom_Level;          // BLAS for the weapon (rebuilt each frame)
+  Gpu_Buffer             Bottom_Level_Scratch;  // Scratch buffer reused across BLAS rebuilds
+  U32                    Texture_Base_Index;     // Starting index into the global texture array for weapon textures
+} Weapon_Instance;
+
+/* Parse a single MD3 surface's geometry (vertices, indices, texture coordinates) into the
+   growing output arrays.  An optional 12-float transform (origin + 3x3 axis matrix) can
+   pre-transform vertices and normals.  Quake 3 coordinate swizzle (x,y,z)->(x,z,-y) is applied. */
+
+void Md3_Parse_Surface (const U8 *Surface_Data, Vertex **Inout_Vertices, U32 *Inout_Vertex_Count,
+                               U32 **Inout_Indices, U32 *Inout_Index_Count,
+                               U32 **Inout_Texture_Ids, U32 *Inout_Triangle_Count,
+                               U32 Assigned_Texture_Index, const F32 *Transform) {
+  const Md3_Surface *Surface = (const Md3_Surface *)Surface_Data;
+  U32 Base_Vertex = *Inout_Vertex_Count;
+
+  // Copy triangle indices, offsetting each by the current vertex base
+  const I32 *Triangles = (const I32 *)(Surface_Data + Surface->Triangles_Offset);
+  *Inout_Indices = realloc (*Inout_Indices, sizeof (U32) * (*Inout_Index_Count + Surface->Number_Of_Triangles * 3));
+  for (I32 Index = 0; Index < Surface->Number_Of_Triangles * 3; Index++) {
+    (*Inout_Indices)[*Inout_Index_Count + Index] = Base_Vertex + (U32)Triangles[Index];
+  }
+
+  // Assign the same texture index to every triangle in this surface
+  *Inout_Texture_Ids = realloc (*Inout_Texture_Ids, sizeof (U32) * (*Inout_Triangle_Count + Surface->Number_Of_Triangles));
+  for (I32 Triangle = 0; Triangle < Surface->Number_Of_Triangles; Triangle++) {
+    (*Inout_Texture_Ids)[*Inout_Triangle_Count + Triangle] = Assigned_Texture_Index;
+  }
+
+  // Decode packed MD3 vertices: I16 xyz at 1/64 scale, plus spherical normal encoding
+  const U8  *Vertex_Data              = Surface_Data + Surface->Vertices_Offset;
+  const F32 *Texture_Coordinate_Data  = (const F32 *)(Surface_Data + Surface->Texture_Coordinates_Offset);
+
+  // Grow the vertex array and decode each compressed MD3 vertex position and normal
+  *Inout_Vertices = realloc (*Inout_Vertices, sizeof (Vertex) * (*Inout_Vertex_Count + Surface->Number_Of_Vertices));
+
+  // Decode each vertex's packed position, spherical normal, and texture coordinates
+  for (I32 Vertex_Index = 0; Vertex_Index < Surface->Number_Of_Vertices; Vertex_Index++) {
+
+    // Unpack the 16-bit position coordinates and scale from MD3's fixed-point representation
+    const I16 *Coordinates = (const I16 *)(Vertex_Data + Vertex_Index * 8);
+    F32 Position_X = Coordinates[0] / 64.f;
+    F32 Position_Y = Coordinates[1] / 64.f;
+    F32 Position_Z = Coordinates[2] / 64.f;
+
+    // Decode the spherical normal from latitude/longitude byte pair
+    U8  Latitude  = Vertex_Data[Vertex_Index * 8 + 6];
+    U8  Longitude = Vertex_Data[Vertex_Index * 8 + 7];
+    F32 Latitude_Angle  = Latitude  * (2.f * (F32)M_PI / 255.f);
+    F32 Longitude_Angle = Longitude * (2.f * (F32)M_PI / 255.f);
+    F32 Normal_X = cosf (Latitude_Angle) * sinf (Longitude_Angle);
+    F32 Normal_Y = sinf (Latitude_Angle) * sinf (Longitude_Angle);
+    F32 Normal_Z = cosf (Longitude_Angle);
+
+    // Optionally apply the tag transform (origin + rotation matrix) to position and normal
+    if (Transform) {
+      F32 Origin_X = Transform[0];
+      F32 Origin_Y = Transform[1];
+      F32 Origin_Z = Transform[2];
+      F32 Transformed_X = Transform[3]  * Position_X + Transform[6]  * Position_Y + Transform[9]  * Position_Z + Origin_X;
+      F32 Transformed_Y = Transform[4]  * Position_X + Transform[7]  * Position_Y + Transform[10] * Position_Z + Origin_Y;
+      F32 Transformed_Z = Transform[5]  * Position_X + Transform[8]  * Position_Y + Transform[11] * Position_Z + Origin_Z;
+      F32 Transformed_Normal_X = Transform[3] * Normal_X + Transform[6] * Normal_Y + Transform[9]  * Normal_Z;
+      F32 Transformed_Normal_Y = Transform[4] * Normal_X + Transform[7] * Normal_Y + Transform[10] * Normal_Z;
+      F32 Transformed_Normal_Z = Transform[5] * Normal_X + Transform[8] * Normal_Y + Transform[11] * Normal_Z;
+      Position_X = Transformed_X;
+      Position_Y = Transformed_Y;
+      Position_Z = Transformed_Z;
+      Normal_X   = Transformed_Normal_X;
+      Normal_Y   = Transformed_Normal_Y;
+      Normal_Z   = Transformed_Normal_Z;
+    }
+
+    // Read texture coordinates and store the final vertex with Quake3 swizzle applied
+    F32 Texture_U = Texture_Coordinate_Data[Vertex_Index * 2];
+    F32 Texture_V = Texture_Coordinate_Data[Vertex_Index * 2 + 1];
+
+      // Assemble the final vertex with position, texture coordinates, and normal
+    (*Inout_Vertices)[*Inout_Vertex_Count + Vertex_Index] = (Vertex){
+      .Position   = {Position_X, Position_Z, -Position_Y },
+      .Texture_Uv = {Texture_U, Texture_V },
+      .Normal     = {Normal_X, Normal_Z, -Normal_Y },
+    };
+  }
+
+  // Advance the running totals
+  *Inout_Vertex_Count   += Surface->Number_Of_Vertices;
+  *Inout_Index_Count    += Surface->Number_Of_Triangles * 3;
+  *Inout_Triangle_Count += Surface->Number_Of_Triangles;
+}
+
+/* Load the three-part machinegun weapon model (body, barrel, hand) from MD3 files.
+   The barrel is pre-transformed by tag_barrel; animation frames are extracted from tag_weapon in the hand model. */
+
+Weapon_Model Weapon_Model_Load (void) {
+  Weapon_Model Result = {0};
+
+  // Open the main weapon body mesh
+  FILE *File = fopen ("assets/models/weapons2/machinegun/machinegun.md3", "rb");
+  if (not File) {printf ("[weapon] machinegun.md3 not found\n"); return Result; }
+
+  // Read the body file into memory and validate the MD3 magic number
+  fseek (File, 0, SEEK_END);
+  long File_Size = ftell (File);
+  rewind (File);
+  U8 *Body_Data = malloc (File_Size);
+  fread (Body_Data, 1, File_Size, File);
+  fclose (File);
+  assert (*(U32 *)Body_Data == MD3_MAGIC);
+
+  // Read body header fields: surface count, tag count, and their offsets
+  I32 Body_Surface_Count   = *(I32 *)(Body_Data + 84);
+  I32 Body_Tag_Count       = *(I32 *)(Body_Data + 80);
+  I32 Body_Tags_Offset     = *(I32 *)(Body_Data + 96);
+  I32 Body_Surfaces_Offset = *(I32 *)(Body_Data + 100);
+
+  // Search for the "tag_barrel" attachment point in the body's tag list
+  memset (Result.Tag_Barrel, 0, sizeof (Result.Tag_Barrel));
+  const Md3_Tag *Body_Tags = (const Md3_Tag *)(Body_Data + Body_Tags_Offset);
+  for (I32 Tag = 0; Tag < Body_Tag_Count; Tag++) {
+    if (strncmp (Body_Tags[Tag].Name, "tag_barrel", 64) == 0) {
+      memcpy (Result.Tag_Barrel, Body_Tags[Tag].Origin, 3 * sizeof (F32));
+      memcpy (Result.Tag_Barrel + 3, Body_Tags[Tag].Axis, 9 * sizeof (F32));
+      break;
+    }
+  }
+
+  // Iterate over each surface in the body and parse its geometry
+  const U8 *Surface_Cursor = Body_Data + Body_Surfaces_Offset;
+  for (I32 Surface = 0; Surface < Body_Surface_Count; Surface++) {
+    const Md3_Surface *Header = (const Md3_Surface *)Surface_Cursor;
+    const char *Shader_Name   = (const char *)(Surface_Cursor + Header->Shaders_Offset);
+
+    // Record the shader name as this surface's texture and parse the geometry
+    U32 Texture_Index = Result.Surface_Count;
+    if (Texture_Index < 3) {
+      snprintf (Result.Texture_Names[Texture_Index], 64, "%s", Shader_Name);
+      Result.Surface_Count++;
+    }
+
+    // Parse the surface geometry into the shared vertex/index/texture arrays
+    Md3_Parse_Surface (/*Surface_Data           =>*/ Surface_Cursor,
+                       /*Inout_Vertices         =>*/ &Result.Vertices,
+                       /*Inout_Vertex_Count     =>*/ &Result.Vertex_Count,
+                       /*Inout_Indices          =>*/ &Result.Indices,
+                       /*Inout_Index_Count      =>*/ &Result.Index_Count,
+                       /*Inout_Texture_Ids      =>*/ &Result.Texture_Ids,
+                       /*Inout_Triangle_Count   =>*/ &Result.Triangle_Count,
+                       /*Assigned_Texture_Index =>*/ Texture_Index,
+                       /*Transform              =>*/ NULL);
+    Surface_Cursor += Header->End_Offset;
+  }
+  free (Body_Data);
+
+  // Load the barrel mesh and pre-transform it by the tag_barrel attachment transform
+  File = fopen ("assets/models/weapons2/machinegun/machinegun_barrel.md3", "rb");
+  if (File) {
+    fseek (File, 0, SEEK_END);
+    File_Size = ftell (File);
+    rewind (File);
+    U8 *Barrel_Data = malloc (File_Size);
+    fread (Barrel_Data, 1, File_Size, File);
+    fclose (File);
+    assert (*(U32 *)Barrel_Data == MD3_MAGIC);
+
+    // Read the barrel model's surface count and offset
+    I32 Barrel_Surface_Count   = *(I32 *)(Barrel_Data + 84);
+    I32 Barrel_Surfaces_Offset = *(I32 *)(Barrel_Data + 100);
+
+    // Parse each barrel surface, applying the tag_barrel attachment transform
+    Surface_Cursor = Barrel_Data + Barrel_Surfaces_Offset;
+    for (I32 Surface = 0; Surface < Barrel_Surface_Count; Surface++) {
+      Md3_Parse_Surface (/*Surface_Data           =>*/ Surface_Cursor,
+                         /*Inout_Vertices         =>*/ &Result.Vertices,
+                         /*Inout_Vertex_Count     =>*/ &Result.Vertex_Count,
+                         /*Inout_Indices          =>*/ &Result.Indices,
+                         /*Inout_Index_Count      =>*/ &Result.Index_Count,
+                         /*Inout_Texture_Ids      =>*/ &Result.Texture_Ids,
+                         /*Inout_Triangle_Count   =>*/ &Result.Triangle_Count,
+                         /*Assigned_Texture_Index =>*/ 0,
+                         /*Transform              =>*/ Result.Tag_Barrel);
+      Surface_Cursor += ((const Md3_Surface *)Surface_Cursor)->End_Offset;
+    }
+    free (Barrel_Data);
+    printf (/*format =>*/ "[weapon] barrel merged,
+            tag_barrel=(%.1f,%.1f,%.1f)\n",
+            Result.Tag_Barrel[0],
+            Result.Tag_Barrel[1],
+            Result.Tag_Barrel[2]);
+  }
+
+  // Load the hand mesh to extract the tag_weapon animation frames for recoil
+  File = fopen ("assets/models/weapons2/machinegun/machinegun_hand.md3", "rb");
+  if (File) {
+    fseek (File, 0, SEEK_END);
+    File_Size = ftell (File);
+    rewind (File);
+    U8 *Hand_Data = malloc (File_Size);
+    fread (Hand_Data, 1, File_Size, File);
+    fclose (File);
+    assert (*(U32 *)Hand_Data == MD3_MAGIC);
+
+    // Extract the hand model's frame count and per-frame tag_weapon transforms
+    I32 Hand_Frame_Count = *(I32 *)(Hand_Data + 76);
+    I32 Hand_Tag_Count   = *(I32 *)(Hand_Data + 80);
+    I32 Hand_Tags_Offset = *(I32 *)(Hand_Data + 96);
+    Result.Animation_Frame_Count = Hand_Frame_Count < 30 ? Hand_Frame_Count : 30;
+
+    // Extract the origin and axis for tag_weapon at each animation frame
+    for (U32 Frame = 0; Frame < Result.Animation_Frame_Count; Frame++) {
+      const Md3_Tag *Tags = (const Md3_Tag *)(Hand_Data + Hand_Tags_Offset + Frame * Hand_Tag_Count * sizeof (Md3_Tag));
+      for (I32 Tag = 0; Tag < Hand_Tag_Count; Tag++) {
+        if (strncmp (Tags[Tag].Name, "tag_weapon", 64) == 0) {
+          memcpy (Result.Tag_Weapon[Frame], Tags[Tag].Origin, 3 * sizeof (F32));
+          memcpy (Result.Tag_Weapon[Frame] + 3, Tags[Tag].Axis, 9 * sizeof (F32));
+          break;
         }
-        /* Q3 swizzle: (x,y,z) → (x,z,-y) */
-        F32 su = stdata[i*2], sv = stdata[i*2+1];
-        (*pv)[*pnv + i] = (Vtx){
-            .pos={px, pz, -py}, .uv={su, sv}, .n={nx, nz, -ny}
+      }
+    }
+    free (Hand_Data);
+    printf ("[weapon] hand: %u animation frames\n", Result.Animation_Frame_Count);
+  }
+
+  // Report the loaded weapon geometry statistics
+  printf (/*format =>*/ "[weapon] loaded: %u vertices,
+          %u triangles,
+          %u surfaces\n",
+          Result.Vertex_Count,
+          Result.Triangle_Count,
+          Result.Surface_Count);
+  return Result;
+}
+
+/* <<vulkan_init>> ====================================================================================== */
+
+/* Create a Vulkan instance with the SDL-required surface extensions plus the debug utils extension,
+   and the Khronos validation layer.  Then create a surface from the SDL window. */
+
+void Vulkan_Create_Instance (Vulkan_Context *Context) {
+
+  // Gather the instance extensions required by SDL for Vulkan surface presentation
+  U32 Extension_Count;
+  SDL_Vulkan_GetInstanceExtensions (Context->Window, &Extension_Count, NULL);
+  const char **Extensions = malloc (sizeof (char *) * (Extension_Count + 1));
+  SDL_Vulkan_GetInstanceExtensions (Context->Window, &Extension_Count, Extensions);
+  Extensions[Extension_Count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+
+  // Enable the Khronos validation layer for debug builds
+  const char *Layers[] = {"VK_LAYER_KHRONOS_validation" };
+
+  // Create the Vulkan instance targeting API version 1.3
+  VK_CHECK (vkCreateInstance (/*pCreateInfo =>*/ &(VkInstanceCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+      .pApplicationInfo = &(VkApplicationInfo){
+        .sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName = "quake3rt",
+        .apiVersion       = VK_API_VERSION_1_3,
+      },
+      .enabledLayerCount       = 1,
+      .ppEnabledLayerNames     = Layers,
+      .enabledExtensionCount   = Extension_Count,
+      .ppEnabledExtensionNames = Extensions,
+    },
+                              /*pAllocator  =>*/ NULL,
+                              /*pInstance   =>*/ &Context->Instance));
+
+  free (Extensions);
+
+  // Create the platform window surface
+  SDL_Vulkan_CreateSurface (Context->Window, Context->Instance, &Context->Surface);
+}
+
+/* Enumerate physical devices and select the first one.  Then find a queue family
+   that supports both graphics operations and presentation to the window surface. */
+
+void Vulkan_Pick_Physical_Device (Vulkan_Context *Context) {
+
+  // Pick the first available physical device
+  U32 Device_Count;
+  vkEnumeratePhysicalDevices (Context->Instance, &Device_Count, NULL);
+  VkPhysicalDevice *Devices = malloc (sizeof (VkPhysicalDevice) * Device_Count);
+  vkEnumeratePhysicalDevices (Context->Instance, &Device_Count, Devices);
+  Context->Physical_Device = Devices[0];
+  free (Devices);
+
+  // Search for a queue family that supports both graphics and surface presentation
+  U32 Family_Count;
+  vkGetPhysicalDeviceQueueFamilyProperties (Context->Physical_Device, &Family_Count, NULL);
+  VkQueueFamilyProperties *Families = malloc (sizeof (*Families) * Family_Count);
+  vkGetPhysicalDeviceQueueFamilyProperties (Context->Physical_Device, &Family_Count, Families);
+
+  // Select the first queue family that supports both graphics and presentation
+  Context->Queue_Family_Index = 0;
+  for (U32 Index = 0; Index < Family_Count; Index++) {
+    VkBool32 Supports_Present;
+    vkGetPhysicalDeviceSurfaceSupportKHR (Context->Physical_Device, Index, Context->Surface, &Supports_Present);
+    if ((Families[Index].queueFlags & VK_QUEUE_GRAPHICS_BIT) and Supports_Present) {
+      Context->Queue_Family_Index = Index;
+      break;
+    }
+  }
+  free (Families);
+}
+
+/* Create the logical device with all required features enabled: Vulkan 1.2 buffer device address
+   and descriptor indexing, Vulkan 1.3 synchronization2 and dynamic rendering, plus the KHR
+   acceleration structure and ray tracing pipeline extensions. */
+
+void Vulkan_Create_Logical_Device (Vulkan_Context *Context) {
+
+  // Chain together the feature structures for acceleration structure and ray tracing pipeline
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR Acceleration_Structure_Features = {
+    .sType                  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+    .accelerationStructure  = VK_TRUE,
+  };
+
+  // Enable ray tracing pipeline features chained to the acceleration structure features
+  VkPhysicalDeviceRayTracingPipelineFeaturesKHR Raytracing_Pipeline_Features = {
+    .sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
+    .pNext              = &Acceleration_Structure_Features,
+    .rayTracingPipeline = VK_TRUE,
+  };
+
+  // Enable Vulkan 1.2 features: buffer device address, descriptor indexing with runtime arrays
+  VkPhysicalDeviceVulkan12Features Vulkan_12_Features = {
+    .sType                                         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    .pNext                                         = &Raytracing_Pipeline_Features,
+    .bufferDeviceAddress                           = VK_TRUE,
+    .descriptorIndexing                            = VK_TRUE,
+    .runtimeDescriptorArray                        = VK_TRUE,
+    .shaderSampledImageArrayNonUniformIndexing     = VK_TRUE,
+    .descriptorBindingPartiallyBound               = VK_TRUE,
+    .descriptorBindingVariableDescriptorCount      = VK_TRUE,
+  };
+
+  // Enable Vulkan 1.3 features: synchronization2 and dynamic rendering
+  VkPhysicalDeviceVulkan13Features Vulkan_13_Features = {
+    .sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    .pNext            = &Vulkan_12_Features,
+    .synchronization2 = VK_TRUE,
+    .dynamicRendering = VK_TRUE,
+  };
+
+  // Specify the required device extensions: swapchain, acceleration structure, ray tracing, deferred ops
+  const char *Device_Extensions[] = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+  };
+
+  // Set queue priority to maximum (1.0) for the single graphics queue
+  F32 Priority = 1.f;
+
+  // Create the logical device with a single graphics queue and all chained features
+  VK_CHECK (vkCreateDevice (/*physicalDevice =>*/ Context->Physical_Device,
+                            /*pCreateInfo    =>*/ &(VkDeviceCreateInfo){
+      .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .pNext                   = &Vulkan_13_Features,
+      .queueCreateInfoCount    = 1,
+      .pQueueCreateInfos       = &(VkDeviceQueueCreateInfo){
+        .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = Context->Queue_Family_Index,
+        .queueCount       = 1,
+        .pQueuePriorities = &Priority,
+      },
+      .enabledExtensionCount   = 4,
+      .ppEnabledExtensionNames = Device_Extensions,
+    },
+                            /*pAllocator     =>*/ NULL,
+                            /*pDevice        =>*/ &Context->Device));
+
+  // Retrieve the queue handle and ray tracing pipeline properties
+  vkGetDeviceQueue (Context->Device, Context->Queue_Family_Index, 0, &Context->Queue);
+
+  // Query the physical device's ray tracing pipeline properties for SBT layout
+  Context->Raytracing_Properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+  VkPhysicalDeviceProperties2 Device_Properties = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+    .pNext = &Context->Raytracing_Properties,
+  };
+  vkGetPhysicalDeviceProperties2 (Context->Physical_Device, &Device_Properties);
+
+  // Load the ray tracing extension function pointers
+  Context->Raytracing = Raytracing_Functions_Load (Context->Device);
+}
+
+/* Create the swapchain using the surface's current extent, BGRA8 SRGB format,
+   and FIFO (v-sync) present mode. */
+
+void Vulkan_Create_Swapchain (Vulkan_Context *Context) {
+  VkSurfaceCapabilitiesKHR Capabilities;
+  vkGetPhysicalDeviceSurfaceCapabilitiesKHR (Context->Physical_Device, Context->Surface, &Capabilities);
+  Context->Swapchain_Extent = Capabilities.currentExtent;
+  Context->Swapchain_Format = VK_FORMAT_B8G8R8A8_SRGB;
+
+  // Request one more image than the minimum to avoid stalling on the driver
+  U32 Image_Count = Capabilities.minImageCount + 1;
+  if (Capabilities.maxImageCount and Image_Count > Capabilities.maxImageCount)
+    Image_Count = Capabilities.maxImageCount;
+
+  // Create the swapchain with the determined format and present mode
+  VK_CHECK (vkCreateSwapchainKHR (/*device      =>*/ Context->Device,
+                                  /*pCreateInfo =>*/ &(VkSwapchainCreateInfoKHR){
+      .sType            = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+      .surface          = Context->Surface,
+      .minImageCount    = Image_Count,
+      .imageFormat      = Context->Swapchain_Format,
+      .imageColorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+      .imageExtent      = Context->Swapchain_Extent,
+      .imageArrayLayers = 1,
+      .imageUsage       = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .preTransform     = Capabilities.currentTransform,
+      .compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      .presentMode      = VK_PRESENT_MODE_FIFO_KHR,
+      .clipped          = VK_TRUE,
+    },
+                                  /*pAllocator  =>*/ NULL,
+                                  /*pSwapchain  =>*/ &Context->Swapchain));
+
+  // Retrieve the swapchain image handles
+  vkGetSwapchainImagesKHR (Context->Device, Context->Swapchain, &Context->Swapchain_Image_Count, NULL);
+  vkGetSwapchainImagesKHR (Context->Device, Context->Swapchain, &Context->Swapchain_Image_Count, Context->Swapchain_Images);
+}
+
+/* Create the command pool, a primary command buffer, a fence for frame synchronization,
+   and two semaphores for image-available and render-finished signaling. */
+
+void Vulkan_Create_Synchronization (Vulkan_Context *Context) {
+  VK_CHECK (vkCreateCommandPool (/*device       =>*/ Context->Device,
+                                 /*pCreateInfo  =>*/ &(VkCommandPoolCreateInfo){
+      .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      .queueFamilyIndex = Context->Queue_Family_Index,
+    },
+                                 /*pAllocator   =>*/ NULL,
+                                 /*pCommandPool =>*/ &Context->Command_Pool));
+
+  VK_CHECK (vkAllocateCommandBuffers (/*device          =>*/ Context->Device,
+                                      /*pAllocateInfo   =>*/ &(VkCommandBufferAllocateInfo){
+      .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool        = Context->Command_Pool,
+      .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+    },
+                                      /*pCommandBuffers =>*/ &Context->Command_Buffer));
+
+  VK_CHECK (vkCreateFence (/*device      =>*/ Context->Device,
+                           /*pCreateInfo =>*/ &(VkFenceCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    },
+                           /*pAllocator  =>*/ NULL,
+                           /*pFence      =>*/ &Context->Fence));
+
+  VkSemaphoreCreateInfo Semaphore_Info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+  VK_CHECK (vkCreateSemaphore (Context->Device, &Semaphore_Info, NULL, &Context->Semaphore_Image_Available));
+  VK_CHECK (vkCreateSemaphore (Context->Device, &Semaphore_Info, NULL, &Context->Semaphore_Render_Finished));
+}
+
+/* Transition the ray tracing storage image from undefined to general layout via a one-shot
+   command buffer so it is ready for shader writes on the first frame. */
+
+void Vulkan_Transition_Storage_Image (Vulkan_Context *Context) {
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    }));
+
+  // Record and submit a layout transition from undefined to general for storage writes
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Context->Command_Buffer,
+                        /*Image              =>*/ Context->Raytracing_Storage_Image.Image,
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_UNDEFINED,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_GENERAL,
+                        /*Source_Access      =>*/ 0,
+                        /*Destination_Access =>*/ VK_ACCESS_SHADER_WRITE_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+      .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers    = &Context->Command_Buffer,
+    },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Context->Queue));
+}
+
+/* <<bsp_loader>> ======================================================================================= */
+
+#define BSP_MAGIC               0x50534249u
+#define BSP_VERSION             46
+#define BSP_ENTITIES            0
+#define BSP_SHADERS             1
+#define BSP_VERTICES            10
+#define BSP_INDICES             11
+#define BSP_FACES               13
+#define BSP_PLANES              2
+#define BSP_NODES               3
+#define BSP_LEAFS               4
+#define BSP_LEAF_SURFACES       5
+#define BSP_LEAF_BRUSHES        6
+#define BSP_BRUSHES             8
+#define BSP_BRUSH_SIDES         9
+#define BSP_LIGHTMAPS           14
+#define CONTENTS_SOLID          1
+#define SURFACE_CLIP_EPSILON    0.125f
+#define SURFACE_TYPE_PLANAR     1
+#define SURFACE_TYPE_PATCH      2
+#define SURFACE_TYPE_MESH       3
+#define TESSELLATION_LEVEL      5
+#define LIGHTMAP_PAGE_SIZE      128
+
+// BSP lump directory entry: byte offset and length of a data lump within the file
+typedef struct {I32 Offset, Length;} Bsp_Lump;
+
+// BSP file header: magic number, version, and the 17-entry lump directory
+typedef struct {
+  U32      Magic, Version; // Magic (0x50534249 = "IBSP") and format version (46 for Quake 3)
+  Bsp_Lump Lumps[17];      // Directory of data lumps indexed by BSP_ENTITIES..BSP_LIGHTMAPS
+} Bsp_Header;
+
+// BSP vertex as stored on disk: position, two UV sets, normal, and vertex color
+typedef struct {
+  F32 Position[3], Texture_Coords[2], Lightmap_Coords[2]; // World XYZ, diffuse UVs, lightmap UVs
+  F32 Normal[3];                                          // Unit surface normal
+  U8  Color[4];                                           // RGBA vertex color (0-255 per channel)
+} Bsp_Vertex;
+
+// BSP face/surface descriptor: references into vertex, index, and lightmap data
+typedef struct {
+  I32 Shader_Index;                            // Material shader
+  I32 Fog_Volume;                              // Fog reference
+  I32 Type;                                    // Surface type (planar/patch/mesh)
+  I32 First_Vertex,       Vertex_Count;        // Starting vertex index and count in the global vertex array
+  I32 First_Index,        Index_Count;         // Starting element index and count in the global index array
+  I32 Lightmap_Index;                          // Lightmap page index (-1 if none)
+  I32 Lightmap_X,         Lightmap_Y;          // Top-left corner of this face's lightmap within its page
+  I32 Lightmap_Width,     Lightmap_Height;     // Dimensions of the lightmap region in texels
+  F32 Lightmap_Origin[3], Lightmap_Vectors[9]; // World-space lightmap placement (origin + 2 basis vectors + normal)
+  I32 Patch_Width,        Patch_Height;        // Control point grid dimensions (only valid for patch surfaces)
+} Bsp_Face;
+
+// BSP shader entry: maps a surface material name to content and surface flags
+typedef struct {
+  char Name[64];        // Shader path (e.g. "textures/gothic_wall/wall01")
+  I32  Flags, Contents; // Surface flags (e.g. translucent) and content flags (e.g. solid, water)
+} Bsp_Shader;
+
+// Axis-aligned splitting plane for BSP tree traversal and brush collision
+typedef struct {
+  F32 Normal[3];                   // Plane normal (axis-aligned planes use 1,0,0 / 0,1,0 / 0,0,1)
+  F32 Distance;                    // Signed distance from origin along the normal
+  U8  Type, Sign_Bits, Padding[2]; // Axis type for fast-path tests and sign bits for AABB checks
+} Collision_Plane;
+
+// BSP tree interior node: splits space by a plane into front and back children
+typedef struct {
+  I32 Plane_Index; // Index of the splitting plane
+  I32 Children[2]; // Front and back child indices (negative values encode leaf indices as ~Child)
+} Collision_Node;
+
+// BSP tree leaf node: references a range of surfaces and brushes for collision testing
+typedef struct {
+  I32 Cluster, Area;                // PVS cluster and area portal indices (unused for collision)
+  I32 First_Surface, Surface_Count; // Range of surfaces in this leaf
+  I32 First_Brush, Brush_Count;     // Range of brush indices in the leaf brush array
+} Collision_Leaf;
+
+// Convex brush: a solid volume defined as the intersection of half-spaces (brush sides)
+typedef struct {
+  I32 First_Side, Side_Count, Shader_Index; // Range of bounding planes and the material shader
+} Collision_Brush;
+
+// Single face of a convex brush, referencing a bounding plane
+typedef struct {
+  I32 Plane_Index, Shader_Index; // Plane defining this face and its material shader
+} Collision_Brush_Side;
+
+// Complete collision map loaded from the BSP: all spatial data structures for trace queries
+typedef struct {
+  Collision_Plane      *Planes;       U32 Plane_Count;      // Splitting and brush planes
+  Collision_Node       *Nodes;        U32 Node_Count;       // BSP tree interior nodes
+  Collision_Leaf       *Leafs;        U32 Leaf_Count;       // BSP tree leaf nodes
+  Collision_Brush      *Brushes;      U32 Brush_Count;      // Convex solid brushes
+  Collision_Brush_Side *Sides;        U32 Side_Count;       // Brush face planes
+  I32                  *Leaf_Brushes; U32 Leaf_Brush_Count; // Indirection array: leaf brush ranges index into this
+  I32                  *Shader_Contents;                    // Content flags per shader index (for solidity tests)
+  U32                   Check_Counter;                      // Monotonic counter to avoid testing the same brush twice
+  U32                  *Brush_Checks;                       // Per-brush last-checked counter (compared to Check_Counter)
+} Collision_Map;
+
+/* Convert a BSP vertex from Quake 3's Z-up coordinate system to our Y-up system: (x,y,z) becomes (x,z,-y). */
+
+Vertex Convert_Bsp_Vertex (const Bsp_Vertex *Source) {
+  return (Vertex){
+    .Position    = {Source->Position[0],        Source->Position[2], -Source->Position[1]},
+    .Texture_Uv  = {Source->Texture_Coords[0],  Source->Texture_Coords[1]},
+    .Lightmap_Uv = {Source->Lightmap_Coords[0], Source->Lightmap_Coords[1]},
+    .Normal      = {Source->Normal[0],          Source->Normal[2],   -Source->Normal[1]},
+  };
+}
+
+/* Evaluate a quadratic Bezier curve at parameter t given three control points. */
+
+V3 Bezier_Evaluate (V3 Control_A, V3 Control_B, V3 Control_C, F32 Parameter) {
+  F32 Complement = 1 - Parameter;
+  return V3_Add (/*Left  =>*/ V3_Add (V3_Scale (Control_A,     Complement * Complement),
+                                      V3_Scale (Control_B, 2 * Complement * Parameter)),
+                 /*Right =>*/ V3_Scale (Control_C, Parameter * Parameter));
+}
+
+/* Tessellate a Bezier patch surface from its control grid into triangles.  The patch is subdivided
+   into a grid of sub-patches (each defined by a 3x3 control point block), and each sub-patch is
+   evaluated at TESSELLATION_LEVEL intervals to produce a smooth triangle mesh. */
+
+U32 Bsp_Tessellate_Patch (const Bsp_Vertex *Control_Grid, int Patch_Width, int Patch_Height,
+                                 Vertex **Inout_Vertices, U32 *Inout_Vertex_Count,
+                                 U32 **Inout_Indices, U32 *Inout_Index_Count) {
+  int Grid_Columns = (Patch_Width - 1) / 2;
+  int Grid_Rows    = (Patch_Height - 1) / 2;
+  int Level        = TESSELLATION_LEVEL;
+  int Stride       = Level + 1;
+
+  // Compute the total vertices and indices this patch will produce and grow the output arrays
+  U32 Added_Vertices = (U32)(Grid_Columns * Grid_Rows * Stride * Stride);
+  U32 Added_Indices  = (U32)(Grid_Columns * Grid_Rows * Level * Level * 6);
+
+  // Grow the output vertex and index arrays to hold the tessellated patch geometry
+  *Inout_Vertices = realloc (*Inout_Vertices, sizeof (Vertex) * (*Inout_Vertex_Count + Added_Vertices));
+  *Inout_Indices  = realloc (*Inout_Indices,  sizeof (U32)    * (*Inout_Index_Count  + Added_Indices));
+
+  // Track the insertion points for new vertices and indices
+  U32 Vertex_Base  = *Inout_Vertex_Count;
+  U32 Index_Cursor = *Inout_Index_Count;
+
+  // Iterate over each 3x3 sub-patch in the control grid
+  for (int Patch_Y = 0; Patch_Y < Grid_Rows; Patch_Y++) for (int Patch_X = 0; Patch_X < Grid_Columns; Patch_X++) {
+    V3 Control_Position[3][3];
+    V3 Control_Normal[3][3];
+    V3 Control_Texture[3][3];
+    V3 Control_Lightmap[3][3];
+
+    // Extract the 3x3 control points for this sub-patch, applying coordinate swizzle
+    for (int Row = 0; Row < 3; Row++)
+      for (int Column = 0; Column < 3; Column++) {
+        const Bsp_Vertex *Vertex_Source = &Control_Grid[(Patch_Y * 2 + Row) * Patch_Width + (Patch_X * 2 + Column)];
+        Control_Position[Row][Column]   = V3_Make (Vertex_Source->Position[0],        Vertex_Source->Position[2], -Vertex_Source->Position[1]);
+        Control_Normal[Row][Column]     = V3_Make (Vertex_Source->Normal[0],          Vertex_Source->Normal[2],   -Vertex_Source->Normal[1]);
+        Control_Texture[Row][Column]    = V3_Make (Vertex_Source->Texture_Coords[0],  Vertex_Source->Texture_Coords[1], 0);
+        Control_Lightmap[Row][Column]   = V3_Make (Vertex_Source->Lightmap_Coords[0], Vertex_Source->Lightmap_Coords[1], 0);
+      }
+
+      // Compute the base vertex offset for this sub-patch in the output array
+    U32 Patch_Base = Vertex_Base + (U32)((Patch_Y * Grid_Columns + Patch_X) * Stride * Stride);
+
+    // Evaluate the bi-quadratic Bezier surface at each tessellation grid point
+    for (int Vertical = 0; Vertical <= Level; Vertical++) {
+      F32 Parameter_V = (F32)Vertical / Level;
+      V3 Row_Position[3], Row_Normal[3], Row_Texture[3], Row_Lightmap[3];
+
+      // First pass: evaluate each row of control points along the V parameter
+      for (int Row = 0; Row < 3; Row++) {
+        Row_Position[Row] = Bezier_Evaluate (Control_Position[Row][0], Control_Position[Row][1], Control_Position[Row][2], Parameter_V);
+        Row_Normal[Row]   = Bezier_Evaluate (Control_Normal[Row][0],   Control_Normal[Row][1],   Control_Normal[Row][2],   Parameter_V);
+        Row_Texture[Row]  = Bezier_Evaluate (Control_Texture[Row][0],  Control_Texture[Row][1],  Control_Texture[Row][2],  Parameter_V);
+        Row_Lightmap[Row] = Bezier_Evaluate (Control_Lightmap[Row][0], Control_Lightmap[Row][1], Control_Lightmap[Row][2], Parameter_V);
+      }
+
+      // Second pass: evaluate the intermediate row results along the U parameter
+      for (int Horizontal = 0; Horizontal <= Level; Horizontal++) {
+        F32 Parameter_U = (F32)Horizontal / Level;
+        V3 Position = Bezier_Evaluate (Row_Position[0], Row_Position[1], Row_Position[2], Parameter_U);
+        V3 Normal   = V3_Normalize (Bezier_Evaluate (Row_Normal[0], Row_Normal[1], Row_Normal[2], Parameter_U));
+        V3 Texture  = Bezier_Evaluate (Row_Texture[0],  Row_Texture[1],  Row_Texture[2],  Parameter_U);
+        V3 Lightmap = Bezier_Evaluate (Row_Lightmap[0], Row_Lightmap[1], Row_Lightmap[2], Parameter_U);
+
+        // Evaluate the bi-quadratic Bezier surface and store the interpolated vertex
+        (*Inout_Vertices)[Patch_Base + Vertical * Stride + Horizontal] = (Vertex){
+          .Position    = {Position.x, Position.y, Position.z },
+          .Texture_Uv  = {Texture.x, Texture.y },
+          .Lightmap_Uv = {Lightmap.x, Lightmap.y },
+          .Normal      = {Normal.x, Normal.y, Normal.z },
         };
+      }
     }
-    *pnv += s->n_verts;
-    *pni += s->n_tris * 3;
-    *pntri += s->n_tris;
+
+    // Generate two triangles for each quad in the tessellated grid
+    for (int Vertical = 0; Vertical < Level; Vertical++) for (int Horizontal = 0; Horizontal < Level; Horizontal++) {
+      U32 Index_A = Patch_Base + Vertical * Stride + Horizontal;
+      U32 Index_B = Index_A + 1;
+      U32 Index_C = Patch_Base + (Vertical + 1) * Stride + Horizontal;
+      U32 Index_D = Index_C + 1;
+      (*Inout_Indices)[Index_Cursor++] = Index_A;
+      (*Inout_Indices)[Index_Cursor++] = Index_C;
+      (*Inout_Indices)[Index_Cursor++] = Index_B;
+      (*Inout_Indices)[Index_Cursor++] = Index_B;
+      (*Inout_Indices)[Index_Cursor++] = Index_C;
+      (*Inout_Indices)[Index_Cursor++] = Index_D;
+    }
+  }
+
+  // Advance the output counts by the number of vertices and indices added
+  *Inout_Vertex_Count += Added_Vertices;
+  *Inout_Index_Count  += Added_Indices;
+  return Added_Indices / 3;
 }
 
-static Weapon weapon_load(void) {
-    Weapon w = {0};
-    /* load body (machinegun.md3) */
-    /* MD3 header: 0=magic(4) 4=ver(4) 8=name(64) 72=flags(4) 76=nframes(4)
-       80=ntags(4) 84=nsurfaces(4) 88=nskins(4) 92=ofs_frames(4) 96=ofs_tags(4)
-       100=ofs_surfaces(4) 104=ofs_eof(4) = 108 bytes total */
-    FILE *f = fopen("assets/models/weapons2/machinegun/machinegun.md3","rb");
-    if (!f) { printf("[wpn] machinegun.md3 not found\n"); return w; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-    U8 *body = malloc(sz); fread(body,1,sz,f); fclose(f);
-    assert(*(U32*)body == MD3_MAGIC);
-    I32 body_n_surf    = *(I32*)(body+84);
-    I32 body_n_tags    = *(I32*)(body+80);
-    I32 body_ofs_tags  = *(I32*)(body+96);
-    I32 body_ofs_surf  = *(I32*)(body+100);
+/* Forward declaration: entity parsing needs the BSP header. */
+Spawn Bsp_Find_Spawn (const U8 *File_Data, const Bsp_Header *Header);
 
-    /* extract tag_barrel from body */
-    memset(w.tag_barrel, 0, sizeof(w.tag_barrel));
-    const MD3Tag *btags = (const MD3Tag*)(body + body_ofs_tags);
-    for (I32 i = 0; i < body_n_tags; i++) {
-        if (strncmp(btags[i].name, "tag_barrel", 64)==0) {
-            memcpy(w.tag_barrel, btags[i].origin, 3*sizeof(F32));
-            memcpy(w.tag_barrel+3, btags[i].axis, 9*sizeof(F32));
-            break;
+/* Load a complete scene from a Quake 3 BSP file.  This parses vertices, indices, faces (planar,
+   mesh, and patch types), shader references, lightmap pages (packed into a single atlas), and
+   optionally populates a collision map and spawn point. */
+
+Scene Scene_Load_From_Bsp (const char *Path, Spawn *Out_Spawn, Collision_Map *Out_Collision) {
+
+  // Read the entire BSP file into memory
+  FILE *File = fopen (Path, "rb");
+  if (not File) {fprintf (stderr, "Cannot open %s\n", Path); exit (1); }
+  fseek (File, 0, SEEK_END);
+  long File_Size = ftell (File);
+  rewind (File);
+  U8 *File_Data = malloc (File_Size);
+  fread (File_Data, 1, File_Size, File);
+  fclose (File);
+
+  // Validate the BSP magic number and version
+  Bsp_Header *Header = (Bsp_Header *)(File_Data);
+  assert (Header->Magic == BSP_MAGIC and Header->Version == BSP_VERSION);
+
+  // Locate the raw lump data for vertices, indices, faces, and shaders
+  Bsp_Vertex *Raw_Vertices   = (Bsp_Vertex *)(File_Data + Header->Lumps[BSP_VERTICES].Offset);
+  U32 Raw_Vertex_Count       = (U32)(Header->Lumps[BSP_VERTICES].Length / sizeof (Bsp_Vertex));
+  I32 *Raw_Indices           = (I32 *)(File_Data + Header->Lumps[BSP_INDICES].Offset);
+  Bsp_Face *Raw_Faces        = (Bsp_Face *)(File_Data + Header->Lumps[BSP_FACES].Offset);
+  U32 Raw_Face_Count         = (U32)(Header->Lumps[BSP_FACES].Length / sizeof (Bsp_Face));
+  Bsp_Shader *Raw_Shaders    = (Bsp_Shader *)(File_Data + Header->Lumps[BSP_SHADERS].Offset);
+  U32 Raw_Shader_Count       = (U32)(Header->Lumps[BSP_SHADERS].Length / sizeof (Bsp_Shader));
+
+  // Build the lightmap atlas by packing all 128x128 lightmap pages into a single texture
+  U32 Lightmap_Lump_Size  = (U32)Header->Lumps[BSP_LIGHTMAPS].Length;
+  U32 Lightmap_Page_Count = Lightmap_Lump_Size / (LIGHTMAP_PAGE_SIZE * LIGHTMAP_PAGE_SIZE * 3);
+  U32 Total_Pages         = Lightmap_Page_Count + 1;
+  U32 Atlas_Columns = 1, Atlas_Rows = 1;
+  U8 *Lightmap_Atlas = NULL;
+  U32 Atlas_Width = 0, Atlas_Height = 0;
+  F32 White_Fallback_U = 0.5f, White_Fallback_V = 0.5f;
+
+  // Pack lightmap pages into a grid atlas if any lightmaps exist
+  if (Lightmap_Page_Count > 0) {
+
+    // Determine the atlas grid dimensions (square-ish layout)
+    while (Atlas_Columns * Atlas_Columns < Total_Pages) Atlas_Columns++;
+    Atlas_Rows   = (Total_Pages + Atlas_Columns - 1) / Atlas_Columns;
+    Atlas_Width  = Atlas_Columns * LIGHTMAP_PAGE_SIZE;
+    Atlas_Height = Atlas_Rows * LIGHTMAP_PAGE_SIZE;
+    Lightmap_Atlas = calloc (Atlas_Width * Atlas_Height * 4, 1);
+
+    // Locate the raw lightmap data in the BSP file
+    const U8 *Lightmap_Data = File_Data + Header->Lumps[BSP_LIGHTMAPS].Offset;
+
+    // Copy each RGB lightmap page into its grid cell, converting RGB to RGBA
+    for (U32 Page = 0; Page < Lightmap_Page_Count; Page++) {
+      U32 Column     = Page % Atlas_Columns;
+      U32 Row        = Page / Atlas_Columns;
+      const U8 *Source = Lightmap_Data + Page * LIGHTMAP_PAGE_SIZE * LIGHTMAP_PAGE_SIZE * 3;
+      for (U32 y = 0; y < LIGHTMAP_PAGE_SIZE; y++)
+      for (U32 x = 0; x < LIGHTMAP_PAGE_SIZE; x++) {
+        U32 Destination  = ((Row * LIGHTMAP_PAGE_SIZE + y) * Atlas_Width + Column * LIGHTMAP_PAGE_SIZE + x) * 4;
+        U32 Source_Index = (y * LIGHTMAP_PAGE_SIZE + x) * 3;
+        Lightmap_Atlas[Destination]     = Source[Source_Index];
+        Lightmap_Atlas[Destination + 1] = Source[Source_Index + 1];
+        Lightmap_Atlas[Destination + 2] = Source[Source_Index + 2];
+        Lightmap_Atlas[Destination + 3] = 255;
+      }
+    }
+
+    // Fill an extra all-white page as a fallback for faces with no lightmap
+    U32 White_Column = Lightmap_Page_Count % Atlas_Columns;
+    U32 White_Row    = Lightmap_Page_Count / Atlas_Columns;
+    for (U32 y = 0; y < LIGHTMAP_PAGE_SIZE; y++)
+    for (U32 x = 0; x < LIGHTMAP_PAGE_SIZE; x++) {
+      U32 Destination = ((White_Row * LIGHTMAP_PAGE_SIZE + y) * Atlas_Width + White_Column * LIGHTMAP_PAGE_SIZE + x) * 4;
+      Lightmap_Atlas[Destination] = Lightmap_Atlas[Destination + 1] = Lightmap_Atlas[Destination + 2] = Lightmap_Atlas[Destination + 3] = 255;
+    }
+    White_Fallback_U = ((F32)White_Column + 0.5f) / (F32)Atlas_Columns;
+    White_Fallback_V = ((F32)White_Row    + 0.5f) / (F32)Atlas_Rows;
+    printf ("[lightmap] %u pages -> %ux%u atlas (%u columns)\n", Lightmap_Page_Count, Atlas_Width, Atlas_Height, Atlas_Columns);
+  }
+
+  // Convert all BSP vertices from Z-up to Y-up coordinate system
+  U32 Vertex_Count = Raw_Vertex_Count;
+  Vertex *Vertices = malloc (sizeof (Vertex) * Vertex_Count);
+  for (U32 Index = 0; Index < Vertex_Count; Index++)
+    Vertices[Index] = Convert_Bsp_Vertex (&Raw_Vertices[Index]);
+
+  // Allocate growing arrays for assembled indices and per-triangle texture IDs
+  U32 *Indices = NULL, *Texture_Ids = NULL;
+  U32  Index_Count = 0, Triangle_Count = 0;
+
+  // Process each face: planar and mesh faces copy indices directly; patch faces are tessellated
+  for (U32 Face_Index = 0; Face_Index < Raw_Face_Count; Face_Index++) {
+    const Bsp_Face *Face = &Raw_Faces[Face_Index];
+
+    // Handle each face type: copy indices for planar/mesh, tessellate for patches
+    if (Face->Type == SURFACE_TYPE_PLANAR or Face->Type == SURFACE_TYPE_MESH) {
+      U32 Face_Triangles = (U32)(Face->Index_Count / 3);
+
+      // Grow the index and texture-id arrays to accommodate this face
+      Indices     = realloc (Indices,     sizeof (U32) * (Index_Count    + Face->Index_Count));
+      Texture_Ids = realloc (Texture_Ids, sizeof (U32) * (Triangle_Count + Face_Triangles));
+
+      // Copy face indices, offsetting by the face's first vertex
+      for (I32 Loop = 0; Loop < Face->Index_Count; Loop++)
+        Indices[Index_Count + Loop] = (U32)(Face->First_Vertex + Raw_Indices[Face->First_Index + Loop]);
+
+      // Assign the face's shader index to each triangle
+      for (U32 Triangle = 0; Triangle < Face_Triangles; Triangle++)
+        Texture_Ids[Triangle_Count + Triangle] = (U32)Face->Shader_Index;
+
+      // Advance the running index and triangle counts
+      Index_Count    += Face->Index_Count;
+      Triangle_Count += Face_Triangles;
+
+      // Remap lightmap UVs from per-page to atlas space, or use the white fallback
+      if (Face->Lightmap_Index >= 0 and Atlas_Columns > 0) {
+        F32 Column_Offset = (F32)((U32)Face->Lightmap_Index % Atlas_Columns);
+        F32 Row_Offset    = (F32)((U32)Face->Lightmap_Index / Atlas_Columns);
+        for (I32 Vertex_Loop = 0; Vertex_Loop < Face->Vertex_Count; Vertex_Loop++) {
+          U32 Vertex_Index = (U32)(Face->First_Vertex + Vertex_Loop);
+          Vertices[Vertex_Index].Lightmap_Uv[0] = (Column_Offset + Vertices[Vertex_Index].Lightmap_Uv[0]) / (F32)Atlas_Columns;
+          Vertices[Vertex_Index].Lightmap_Uv[1] = (Row_Offset    + Vertices[Vertex_Index].Lightmap_Uv[1]) / (F32)Atlas_Rows;
         }
-    }
-
-    /* parse body surfaces */
-    const U8 *sp = body + body_ofs_surf;
-    for (I32 i = 0; i < body_n_surf; i++) {
-        const MD3Surf *s = (const MD3Surf*)sp;
-        /* shader name from surface's shader list */
-        const char *shd_name = (const char*)(sp + s->ofs_shaders);
-        U32 tidx = w.n_surfaces;
-        if (tidx < 3) {
-            snprintf(w.tex_name[tidx], 64, "%s", shd_name);
-            w.n_surfaces++;
+      } else {
+        for (I32 Vertex_Loop = 0; Vertex_Loop < Face->Vertex_Count; Vertex_Loop++) {
+          U32 Vertex_Index = (U32)(Face->First_Vertex + Vertex_Loop);
+          Vertices[Vertex_Index].Lightmap_Uv[0] = White_Fallback_U;
+          Vertices[Vertex_Index].Lightmap_Uv[1] = White_Fallback_V;
         }
-        md3_parse_surface(sp, &w.verts, &w.nv, &w.idxs, &w.ni,
-                          &w.tex_ids, &w.ntri, tidx, NULL);
-        sp += s->ofs_end;
-    }
-    free(body);
+      }
 
-    /* load barrel (machinegun_barrel.md3) — pre-transform by tag_barrel */
-    f = fopen("assets/models/weapons2/machinegun/machinegun_barrel.md3","rb");
-    if (f) {
-        fseek(f,0,SEEK_END); sz=ftell(f); rewind(f);
-        U8 *brl = malloc(sz); fread(brl,1,sz,f); fclose(f);
-        assert(*(U32*)brl == MD3_MAGIC);
-        I32 brl_n_surf = *(I32*)(brl+84);
-        I32 brl_ofs_surf = *(I32*)(brl+100);
-        sp = brl + brl_ofs_surf;
-        for (I32 i = 0; i < brl_n_surf; i++) {
-            const MD3Surf *s = (const MD3Surf*)sp;
-            U32 tidx = 0; /* barrel uses same texture as body (mgun.tga) */
-            md3_parse_surface(sp, &w.verts, &w.nv, &w.idxs, &w.ni,
-                              &w.tex_ids, &w.ntri, tidx, w.tag_barrel);
-            (void)s;
-            sp += ((const MD3Surf*)sp)->ofs_end;
+    // Tessellate the Bezier patch into triangles
+    } else if (Face->Type == SURFACE_TYPE_PATCH) {
+      U32 Previous_Vertex_Count   = Vertex_Count;
+      U32 Previous_Triangle_Count = Triangle_Count;
+
+      // Tessellate the Bezier patch and assign shader indices to the new triangles
+      Triangle_Count += Bsp_Tessellate_Patch (/*Control_Grid       =>*/ &Raw_Vertices[Face->First_Vertex],
+                                              /*Patch_Width        =>*/ Face->Patch_Width,
+                                              /*Patch_Height       =>*/ Face->Patch_Height,
+                                              /*Inout_Vertices     =>*/ &Vertices,
+                                              /*Inout_Vertex_Count =>*/ &Vertex_Count,
+                                              /*Inout_Indices      =>*/ &Indices,
+                                              /*Inout_Index_Count  =>*/ &Index_Count);
+
+      // Assign shader indices to the newly tessellated triangles
+      U32 Patch_Triangles = Triangle_Count - Previous_Triangle_Count;
+      Texture_Ids = realloc (Texture_Ids, sizeof (U32) * Triangle_Count);
+      for (U32 Triangle = 0; Triangle < Patch_Triangles; Triangle++)
+        Texture_Ids[Previous_Triangle_Count + Triangle] = (U32)Face->Shader_Index;
+
+      // Remap lightmap UVs for the tessellated vertices
+      if (Face->Lightmap_Index >= 0 and Atlas_Columns > 0) {
+        F32 Column_Offset = (F32)((U32)Face->Lightmap_Index % Atlas_Columns);
+        F32 Row_Offset    = (F32)((U32)Face->Lightmap_Index / Atlas_Columns);
+        for (U32 Vertex_Index = Previous_Vertex_Count; Vertex_Index < Vertex_Count; Vertex_Index++) {
+          Vertices[Vertex_Index].Lightmap_Uv[0] = (Column_Offset + Vertices[Vertex_Index].Lightmap_Uv[0]) / (F32)Atlas_Columns;
+          Vertices[Vertex_Index].Lightmap_Uv[1] = (Row_Offset    + Vertices[Vertex_Index].Lightmap_Uv[1]) / (F32)Atlas_Rows;
         }
-        free(brl);
-        printf("[wpn] barrel merged, tag_barrel=(%.1f,%.1f,%.1f)\n",
-               w.tag_barrel[0],w.tag_barrel[1],w.tag_barrel[2]);
-    }
-
-    /* load hand (machinegun_hand.md3) — extract tag_weapon animation */
-    f = fopen("assets/models/weapons2/machinegun/machinegun_hand.md3","rb");
-    if (f) {
-        fseek(f,0,SEEK_END); sz=ftell(f); rewind(f);
-        U8 *hand = malloc(sz); fread(hand,1,sz,f); fclose(f);
-        assert(*(U32*)hand == MD3_MAGIC);
-        I32 hand_n_frames = *(I32*)(hand+76);
-        I32 hand_n_tags = *(I32*)(hand+80);
-        I32 hand_ofs_tags = *(I32*)(hand+96);
-        w.n_anim_frames = hand_n_frames < 30 ? hand_n_frames : 30;
-        for (U32 fr = 0; fr < w.n_anim_frames; fr++) {
-            const MD3Tag *tags = (const MD3Tag*)(hand + hand_ofs_tags +
-                                  fr * hand_n_tags * sizeof(MD3Tag));
-            for (I32 t = 0; t < hand_n_tags; t++) {
-                if (strncmp(tags[t].name, "tag_weapon", 64)==0) {
-                    memcpy(w.tag_wpn[fr], tags[t].origin, 3*sizeof(F32));
-                    memcpy(w.tag_wpn[fr]+3, tags[t].axis, 9*sizeof(F32));
-                    break;
-                }
-            }
+      } else {
+        for (U32 Vertex_Index = Previous_Vertex_Count; Vertex_Index < Vertex_Count; Vertex_Index++) {
+          Vertices[Vertex_Index].Lightmap_Uv[0] = White_Fallback_U;
+          Vertices[Vertex_Index].Lightmap_Uv[1] = White_Fallback_V;
         }
-        free(hand);
-        printf("[wpn] hand: %u animation frames\n", w.n_anim_frames);
+      }
+    }
+  }
+
+  // Build per-material fallback colors by hashing the shader name to a deterministic RGB value
+  U32 Material_Count = Raw_Shader_Count;
+  V4 *Materials = malloc (sizeof (V4) * Material_Count);
+  char (*Texture_Names)[64] = malloc (sizeof (char[64]) * Material_Count);
+
+    // Hash each shader name to generate a deterministic fallback color
+  for (U32 Material = 0; Material < Material_Count; Material++) {
+    U32 Hash = 5381;
+    for (int Character = 0; Raw_Shaders[Material].Name[Character]; Character++)
+      Hash = Hash * 31 + (U8)Raw_Shaders[Material].Name[Character];
+    Materials[Material] = (V4){
+      0.4f + 0.35f * ((Hash >> 0  & 0xFF) / 255.f),
+      0.4f + 0.35f * ((Hash >> 8  & 0xFF) / 255.f),
+      0.4f + 0.35f * ((Hash >> 16 & 0xFF) / 255.f),
+      1,
+    };
+    memcpy (Texture_Names[Material], Raw_Shaders[Material].Name, 64);
+  }
+
+  // Parse the spawn point from the entity lump
+  if (Out_Spawn)
+    *Out_Spawn = Bsp_Find_Spawn (File_Data, Header);
+
+  // Load collision data from planes, nodes, leafs, brushes, and brush sides lumps
+  if (Out_Collision) {
+    Collision_Map *Collision = Out_Collision;
+    memset (Collision, 0, sizeof (*Collision));
+
+    // Parse planes (16 bytes each: float normal[3], float distance) with coordinate swizzle
+    Collision->Plane_Count = (U32)Header->Lumps[BSP_PLANES].Length / 16;
+    Collision->Planes      = malloc (sizeof (Collision_Plane) * Collision->Plane_Count);
+    for (U32 Index = 0; Index < Collision->Plane_Count; Index++) {
+      const F32 *Source = (const F32 *)(File_Data + Header->Lumps[BSP_PLANES].Offset + Index * 16);
+      Collision->Planes[Index].Normal[0] =  Source[0];
+      Collision->Planes[Index].Normal[1] =  Source[2];
+      Collision->Planes[Index].Normal[2] = -Source[1];
+      Collision->Planes[Index].Distance  =  Source[3];
+      F32 *Normal = Collision->Planes[Index].Normal;
+      Collision->Planes[Index].Type      = (Normal[0] == 1.f) ? 0 : (Normal[1] == 1.f) ? 1 : (Normal[2] == 1.f) ? 2 : 3;
+      Collision->Planes[Index].Sign_Bits = (U8)((Normal[0] < 0) | ((Normal[1] < 0) << 1) | ((Normal[2] < 0) << 2));
     }
 
-    printf("[wpn] loaded: %u verts, %u tris, %u surfaces\n", w.nv, w.ntri, w.n_surfaces);
-    return w;
-}
-
-/* <<vkinit>> ============================================================ */
-
-static void vk_create_instance(Ctx *C) {
-    U32 n_ext; SDL_Vulkan_GetInstanceExtensions(C->win, &n_ext, NULL);
-    const char **exts = malloc(sizeof(char*)*(n_ext+1));
-    SDL_Vulkan_GetInstanceExtensions(C->win, &n_ext, exts);
-    exts[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-
-    const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
-    VK(vkCreateInstance(&(VkInstanceCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pApplicationInfo=&(VkApplicationInfo){
-            .sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
-            .pApplicationName="quake3rt",
-            .apiVersion=VK_API_VERSION_1_3
-        },
-        .enabledLayerCount=1, .ppEnabledLayerNames=layers,
-        .enabledExtensionCount=n_ext, .ppEnabledExtensionNames=exts
-    }, NULL, &C->inst));
-    free(exts);
-    SDL_Vulkan_CreateSurface(C->win, C->inst, &C->surf);
-}
-
-static void vk_pick_device(Ctx *C) {
-    U32 n; vkEnumeratePhysicalDevices(C->inst,&n,NULL);
-    VkPhysicalDevice *pds = malloc(sizeof(VkPhysicalDevice)*n);
-    vkEnumeratePhysicalDevices(C->inst,&n,pds);
-    C->pd = pds[0];
-    free(pds);
-
-    U32 nq; vkGetPhysicalDeviceQueueFamilyProperties(C->pd,&nq,NULL);
-    VkQueueFamilyProperties *qf = malloc(sizeof(*qf)*nq);
-    vkGetPhysicalDeviceQueueFamilyProperties(C->pd,&nq,qf);
-    C->qi = 0;
-    for (U32 i=0;i<nq;i++) {
-        VkBool32 present;
-        vkGetPhysicalDeviceSurfaceSupportKHR(C->pd,i,C->surf,&present);
-        if ((qf[i].queueFlags&VK_QUEUE_GRAPHICS_BIT) && present) { C->qi=i; break; }
+    // Parse BSP nodes (36 bytes each: int plane, children[2], mins[3], maxs[3])
+    Collision->Node_Count = (U32)Header->Lumps[BSP_NODES].Length / 36;
+    Collision->Nodes      = malloc (sizeof (Collision_Node) * Collision->Node_Count);
+    for (U32 Index = 0; Index < Collision->Node_Count; Index++) {
+      const I32 *Source = (const I32 *)(File_Data + Header->Lumps[BSP_NODES].Offset + Index * 36);
+      Collision->Nodes[Index].Plane_Index = Source[0];
+      Collision->Nodes[Index].Children[0] = Source[1];
+      Collision->Nodes[Index].Children[1] = Source[2];
     }
-    free(qf);
+
+    // Parse BSP leafs (48 bytes each)
+    Collision->Leaf_Count = (U32)Header->Lumps[BSP_LEAFS].Length / 48;
+    Collision->Leafs      = malloc (sizeof (Collision_Leaf) * Collision->Leaf_Count);
+    for (U32 Index = 0; Index < Collision->Leaf_Count; Index++) {
+      const I32 *Source = (const I32 *)(File_Data + Header->Lumps[BSP_LEAFS].Offset + Index * 48);
+      Collision->Leafs[Index].Cluster       = Source[0];
+      Collision->Leafs[Index].Area          = Source[1];
+      Collision->Leafs[Index].First_Surface = Source[8];
+      Collision->Leafs[Index].Surface_Count = Source[9];
+      Collision->Leafs[Index].First_Brush   = Source[10];
+      Collision->Leafs[Index].Brush_Count   = Source[11];
+    }
+
+    // Copy leaf brush index array verbatim
+    Collision->Leaf_Brush_Count = (U32)Header->Lumps[BSP_LEAF_BRUSHES].Length / 4;
+    Collision->Leaf_Brushes     = malloc (sizeof (I32) * Collision->Leaf_Brush_Count);
+    memcpy (Collision->Leaf_Brushes, File_Data + Header->Lumps[BSP_LEAF_BRUSHES].Offset, sizeof (I32) * Collision->Leaf_Brush_Count);
+
+    // Parse brushes (12 bytes each: int first_side, side_count, shader)
+    Collision->Brush_Count = (U32)Header->Lumps[BSP_BRUSHES].Length / 12;
+    Collision->Brushes     = malloc (sizeof (Collision_Brush) * Collision->Brush_Count);
+    for (U32 Index = 0; Index < Collision->Brush_Count; Index++) {
+      const I32 *Source = (const I32 *)(File_Data + Header->Lumps[BSP_BRUSHES].Offset + Index * 12);
+      Collision->Brushes[Index].First_Side   = Source[0];
+      Collision->Brushes[Index].Side_Count   = Source[1];
+      Collision->Brushes[Index].Shader_Index = Source[2];
+    }
+
+    // Parse brush sides (8 bytes each: int plane, shader)
+    Collision->Side_Count = (U32)Header->Lumps[BSP_BRUSH_SIDES].Length / 8;
+    Collision->Sides      = malloc (sizeof (Collision_Brush_Side) * Collision->Side_Count);
+    for (U32 Index = 0; Index < Collision->Side_Count; Index++) {
+      const I32 *Source = (const I32 *)(File_Data + Header->Lumps[BSP_BRUSH_SIDES].Offset + Index * 8);
+      Collision->Sides[Index].Plane_Index  = Source[0];
+      Collision->Sides[Index].Shader_Index = Source[1];
+    }
+
+    // Extract the contents flags from each shader for solid-brush filtering
+    Collision->Shader_Contents = malloc (sizeof (I32) * Raw_Shader_Count);
+    for (U32 Shader = 0; Shader < Raw_Shader_Count; Shader++)
+      Collision->Shader_Contents[Shader] = Raw_Shaders[Shader].Contents;
+
+    // Allocate the per-brush deduplication check array
+    Collision->Brush_Checks  = calloc (Collision->Brush_Count, sizeof (U32));
+    Collision->Check_Counter = 0;
+
+    // Report the collision map statistics
+    printf (/*format =>*/ "[collision] %u planes,
+            %u nodes,
+            %u leafs,
+            %u brushes,
+            %u sides\n",
+            Collision->Plane_Count,
+            Collision->Node_Count,
+            Collision->Leaf_Count,
+            Collision->Brush_Count,
+            Collision->Side_Count);
+  }
+
+  // Release the raw BSP file buffer and return the assembled scene
+  free (File_Data);
+  printf ("[bsp] %s: %u vertices, %u triangles, %u shaders\n", Path, Vertex_Count, Triangle_Count, Raw_Shader_Count);
+
+  return (Scene){
+    .Vertices        = Vertices,       .Vertex_Count    = Vertex_Count,
+    .Indices         = Indices,        .Index_Count     = Index_Count,
+    .Materials       = Materials,      .Material_Count  = Material_Count,
+    .Texture_Ids     = Texture_Ids,    .Texture_Names   = Texture_Names,
+    .Triangle_Count  = Triangle_Count,
+    .Lightmap_Atlas  = Lightmap_Atlas, .Lightmap_Width  = Atlas_Width,    .Lightmap_Height = Atlas_Height,
+  };
 }
 
-static void vk_create_device(Ctx *C) {
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR f_as = {
-        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-        .accelerationStructure=VK_TRUE
-    };
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR f_rt = {
-        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
-        .pNext=&f_as, .rayTracingPipeline=VK_TRUE
-    };
-    VkPhysicalDeviceVulkan12Features f12 = {
-        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        .pNext=&f_rt,
-        .bufferDeviceAddress=VK_TRUE,
-        .descriptorIndexing=VK_TRUE,
-        .runtimeDescriptorArray=VK_TRUE,
-        .shaderSampledImageArrayNonUniformIndexing=VK_TRUE,
-        .descriptorBindingPartiallyBound=VK_TRUE,
-        .descriptorBindingVariableDescriptorCount=VK_TRUE
-    };
-    VkPhysicalDeviceVulkan13Features f13 = {
-        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext=&f12, .synchronization2=VK_TRUE, .dynamicRendering=VK_TRUE
-    };
+/* <<bsp_entities>> ===================================================================================== */
 
-    const char *dev_exts[] = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
-        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
-        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-    };
-    F32 prio = 1.f;
-    VK(vkCreateDevice(C->pd, &(VkDeviceCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext=&f13,
-        .queueCreateInfoCount=1,
-        .pQueueCreateInfos=&(VkDeviceQueueCreateInfo){
-            .sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .queueFamilyIndex=C->qi, .queueCount=1, .pQueuePriorities=&prio
-        },
-        .enabledExtensionCount=4, .ppEnabledExtensionNames=dev_exts
-    }, NULL, &C->dev));
-    vkGetDeviceQueue(C->dev, C->qi, 0, &C->q);
+/* Parse the BSP entity lump to find the first info_player_deathmatch spawn point.
+   Returns the origin (swizzled to Y-up) and facing angle. */
 
-    C->rt_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-    VkPhysicalDeviceProperties2 p2 = {
-        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext=&C->rt_props
-    };
-    vkGetPhysicalDeviceProperties2(C->pd, &p2);
-    C->rt = rtfn_load(C->dev);
+Spawn Bsp_Find_Spawn (const U8 *File_Data, const Bsp_Header *Header) {
+  const char *Entities = (const char *)(File_Data + Header->Lumps[BSP_ENTITIES].Offset);
+  I32 Length = Header->Lumps[BSP_ENTITIES].Length;
+  Spawn Result = {.Origin = {0, 0, 0}, .Angle = 0 };
+
+  // Set up cursor to walk through the entity lump text
+  const char *Cursor = Entities;
+  const char *End    = Entities + Length;
+
+  // Walk through each entity block delimited by curly braces
+  while (Cursor < End) {
+    while (Cursor < End and *Cursor != '{') Cursor++;
+    if (Cursor >= End) break;
+    Cursor++;
+
+    // Initialize per-entity state for tracking spawn candidates
+    int  Is_Spawn   = 0;
+    V3   Origin     = {0, 0, 0};
+    F32  Angle      = 0;
+    int  Has_Origin = 0;
+
+    // Parse key-value pairs within this entity
+    while (Cursor < End and *Cursor != '}') {
+      while (Cursor < End and (*Cursor == ' ' or *Cursor == '\t' or *Cursor == '\n' or *Cursor == '\r'))
+        Cursor++;
+      if (Cursor >= End or *Cursor == '}') break;
+
+      // Read the quoted key string
+      if (*Cursor != '"') {Cursor++; continue; }
+      Cursor++;
+      const char *Key = Cursor;
+      while (Cursor < End and *Cursor != '"') Cursor++;
+      int Key_Length = (int)(Cursor - Key);
+      if (Cursor < End) Cursor++;
+
+      // Skip leading whitespace before the value string
+      while (Cursor < End and (*Cursor == ' ' or *Cursor == '\t')) Cursor++;
+
+      // Read the quoted value string
+      if (Cursor >= End or *Cursor != '"') continue;
+      Cursor++;
+      const char *Value = Cursor;
+      while (Cursor < End and *Cursor != '"') Cursor++;
+      int Value_Length = (int)(Cursor - Value);
+      if (Cursor < End) Cursor++;
+
+      // Check if this entity is a deathmatch spawn point
+      if (Key_Length == 9 and memcmp (Key, "classname", 9) == 0
+          and Value_Length == 22 and memcmp (Value, "info_player_deathmatch", 22) == 0)
+        Is_Spawn = 1;
+
+      // Parse the "origin" key into three floats
+      if (Key_Length == 6 and memcmp (Key, "origin", 6) == 0) {
+        char Temporary[64];
+        int Limit = Value_Length < 63 ? Value_Length : 63;
+        memcpy (Temporary, Value, Limit);
+        Temporary[Limit] = 0;
+        sscanf (Temporary, "%f %f %f", &Origin.x, &Origin.y, &Origin.z);
+        Has_Origin = 1;
+      }
+
+      // Parse the "angle" key into a facing direction
+      if (Key_Length == 5 and memcmp (Key, "angle", 5) == 0) {
+        char Temporary[32];
+        int Limit = Value_Length < 31 ? Value_Length : 31;
+        memcpy (Temporary, Value, Limit);
+        Temporary[Limit] = 0;
+        sscanf (Temporary, "%f", &Angle);
+      }
+    }
+
+    // If this entity is a spawn with a valid origin, swizzle and return it
+    if (Is_Spawn and Has_Origin) {
+      Result.Origin = V3_Make (Origin.x, Origin.z, -Origin.y);
+      Result.Angle  = Angle;
+      printf ("[bsp] spawn: %.0f %.0f %.0f angle %.0f\n", Result.Origin.x, Result.Origin.y, Result.Origin.z, Angle);
+      return Result;
+    }
+    if (Cursor < End) Cursor++;
+  }
+
+  printf ("[bsp] no spawn found, using origin\n");
+  return Result;
 }
 
-static void vk_create_swapchain(Ctx *C) {
-    VkSurfaceCapabilitiesKHR cap;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(C->pd,C->surf,&cap);
-    C->sc_ext = cap.currentExtent;
-    C->sc_fmt = VK_FORMAT_B8G8R8A8_SRGB;
+/* <<collision>> ======================================================================================== */
 
-    U32 nimgs = cap.minImageCount + 1;
-    if (cap.maxImageCount && nimgs > cap.maxImageCount) nimgs = cap.maxImageCount;
-
-    VK(vkCreateSwapchainKHR(C->dev, &(VkSwapchainCreateInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-        .surface=C->surf, .minImageCount=nimgs,
-        .imageFormat=C->sc_fmt, .imageColorSpace=VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-        .imageExtent=C->sc_ext, .imageArrayLayers=1,
-        .imageUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .imageSharingMode=VK_SHARING_MODE_EXCLUSIVE,
-        .preTransform=cap.currentTransform,
-        .compositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode=VK_PRESENT_MODE_FIFO_KHR,
-        .clipped=VK_TRUE
-    }, NULL, &C->sc));
-
-    vkGetSwapchainImagesKHR(C->dev,C->sc,&C->sc_n,NULL);
-    vkGetSwapchainImagesKHR(C->dev,C->sc,&C->sc_n,C->sc_img);
-}
-
-static void vk_create_sync(Ctx *C) {
-    VK(vkCreateCommandPool(C->dev, &(VkCommandPoolCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-        .queueFamilyIndex=C->qi
-    }, NULL, &C->pool));
-    VK(vkAllocateCommandBuffers(C->dev, &(VkCommandBufferAllocateInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool=C->pool, .level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount=1
-    }, &C->cmd));
-    VK(vkCreateFence(C->dev, &(VkFenceCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .flags=VK_FENCE_CREATE_SIGNALED_BIT
-    }, NULL, &C->fence));
-    VkSemaphoreCreateInfo si = {.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    VK(vkCreateSemaphore(C->dev,&si,NULL,&C->sem_img));
-    VK(vkCreateSemaphore(C->dev,&si,NULL,&C->sem_done));
-}
-
-static void vk_transition_storage_image(Ctx *C) {
-    VK(vkResetCommandBuffer(C->cmd, 0));
-    VK(vkBeginCommandBuffer(C->cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    img_barrier(C->cmd, C->rt_img.i,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-        0, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-    VK(vkEndCommandBuffer(C->cmd));
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd
-    }, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(C->q));
-}
-
-/* <<bsp-loader>> ========================================================= */
-
-#define BSP_MAGIC     0x50534249u
-#define BSP_VER       46
-#define BSP_ENTITIES  0
-#define BSP_SHADERS   1
-#define BSP_VERTS     10
-#define BSP_IDXS      11
-#define BSP_FACES     13
-#define BSP_PLANES      2
-#define BSP_NODES       3
-#define BSP_LEAFS       4
-#define BSP_LEAFSURFS   5
-#define BSP_LEAFBRUSHES 6
-#define BSP_BRUSHES     8
-#define BSP_BRUSHSIDES  9
-#define BSP_LIGHTMAPS 14
-#define CONTENTS_SOLID  1
-#define SURF_CLIP_EPS   0.125f
-#define MST_PLANAR    1
-#define MST_PATCH     2
-#define MST_MESH      3
-#define TESS_LOD      5
-#define LM_SIZE       128
-
-typedef struct { I32 ofs,len; }                        BLump;
-typedef struct { U32 magic,ver; BLump lumps[17]; }     BHdr;
-typedef struct { F32 xyz[3],st[2],lm[2],n[3]; U8 c[4];} BVtx;
-typedef struct { I32 shd,fog,type,fv,nv,fi,ni,
-                     lm,lmx,lmy,lmw,lmh;
-                 F32 lmorg[3],lmvec[9]; I32 pw,ph; }   BFace;
-typedef struct { char name[64]; I32 flags,contents; }  BShd;
-
-typedef struct { F32 normal[3]; F32 dist; U8 type, signbits, pad[2]; } CPlane;
-typedef struct { I32 plane; I32 children[2]; } CNode;
-typedef struct { I32 cluster, area;
-                 I32 first_surf, n_surfs; I32 first_brush, n_brushes; } CLeaf;
-typedef struct { I32 first_side, n_sides, shader; } CBrush;
-typedef struct { I32 plane, shader; } CBrushSide;
-
+// Result of a collision trace: records the nearest contact point and surface normal
 typedef struct {
-    CPlane     *planes;     U32 n_planes;
-    CNode      *nodes;      U32 n_nodes;
-    CLeaf      *leafs;      U32 n_leafs;
-    CBrush     *brushes;    U32 n_brushes;
-    CBrushSide *sides;      U32 n_sides;
-    I32        *leaf_brushes; U32 n_leaf_brushes;
-    I32        *shd_contents;
-    U32         check;
-    U32        *brush_check;
-} ColMap;
+  F32 Fraction;          // Parametric distance along the trace (0.0 = start, 1.0 = no collision)
+  V3  End_Position;      // World-space position where the trace was stopped
+  V3  Normal;            // Surface normal at the contact point
+  int Start_Solid, All_Solid;  // Start_Solid: trace began inside a brush; All_Solid: trace is entirely embedded
+} Trace_Result;
 
-static Vtx bvtx_conv(const BVtx *b) {
-    /* Q3 Z-up (x,y,z) → Y-up (x,z,-y); _q = raw lightmap UVs */
-    return (Vtx){.pos={b->xyz[0], b->xyz[2], -b->xyz[1]},
-                 .uv ={b->st[0],  b->st[1]},
-                 ._q ={b->lm[0],  b->lm[1]},
-                 .n  ={b->n[0],   b->n[2],   -b->n[1]}};
-}
-
-static V3 bez3v(V3 a, V3 b, V3 c, F32 t) {
-    F32 s=1-t;
-    return v3add(v3add(v3scale(a,s*s),v3scale(b,2*s*t)),v3scale(c,t*t));
-}
-
-static U32 bsp_tess_patch(const BVtx *cg, int pw, int ph,
-                           Vtx **pv, U32 *pnv, U32 **pi, U32 *pni) {
-    int nx=(pw-1)/2, ny=(ph-1)/2, L=TESS_LOD, S=L+1;
-    U32 addv=(U32)(nx*ny*S*S), addi=(U32)(nx*ny*L*L*6);
-    *pv = realloc(*pv, sizeof(Vtx)*(*pnv+addv));
-    *pi = realloc(*pi, sizeof(U32)*(*pni+addi));
-    U32 vbase=*pnv, ii=*pni;
-    for (int py=0;py<ny;py++) for (int px=0;px<nx;px++) {
-        V3 cp[3][3], cn[3][3], ct[3][3], cl[3][3];
-        for (int r=0;r<3;r++) for (int c=0;c<3;c++) {
-            const BVtx *v=&cg[(py*2+r)*pw+(px*2+c)];
-            /* Q3 Z-up → Y-up swizzle */
-            cp[r][c]=v3(v->xyz[0], v->xyz[2], -v->xyz[1]);
-            cn[r][c]=v3(v->n[0],   v->n[2],   -v->n[1]);
-            ct[r][c]=v3(v->st[0],  v->st[1],  0);
-            cl[r][c]=v3(v->lm[0],  v->lm[1],  0);
-        }
-        U32 pb=vbase+(U32)((py*nx+px)*S*S);
-        for (int j=0;j<=L;j++) {
-            F32 t=(F32)j/L; V3 qp[3],qn[3],qt[3],ql[3];
-            for (int r=0;r<3;r++) {
-                qp[r]=bez3v(cp[r][0],cp[r][1],cp[r][2],t);
-                qn[r]=bez3v(cn[r][0],cn[r][1],cn[r][2],t);
-                qt[r]=bez3v(ct[r][0],ct[r][1],ct[r][2],t);
-                ql[r]=bez3v(cl[r][0],cl[r][1],cl[r][2],t);
-            }
-            for (int i=0;i<=L;i++) {
-                F32 s=(F32)i/L;
-                V3 pos=bez3v(qp[0],qp[1],qp[2],s);
-                V3 nor=v3norm(bez3v(qn[0],qn[1],qn[2],s));
-                V3 tex=bez3v(qt[0],qt[1],qt[2],s);
-                V3 lmv=bez3v(ql[0],ql[1],ql[2],s);
-                (*pv)[pb+j*S+i]=(Vtx){.pos={pos.x,pos.y,pos.z},
-                                       .uv={tex.x,tex.y},
-                                       ._q={lmv.x,lmv.y},
-                                       .n={nor.x,nor.y,nor.z}};
-            }
-        }
-        for (int j=0;j<L;j++) for (int i=0;i<L;i++) {
-            U32 a=pb+j*S+i,b=a+1,c=pb+(j+1)*S+i,d=c+1;
-            (*pi)[ii++]=a;(*pi)[ii++]=c;(*pi)[ii++]=b;
-            (*pi)[ii++]=b;(*pi)[ii++]=c;(*pi)[ii++]=d;
-        }
-    }
-    *pnv+=addv; *pni+=addi;
-    return addi/3;
-}
-
-static Spawn bsp_find_spawn(const U8 *data, const BHdr *hdr);
-
-static Scene scene_load_bsp(const char *path, Spawn *out_spawn, ColMap *out_col) {
-    FILE *f=fopen(path,"rb");
-    if (!f) { fprintf(stderr,"Cannot open %s\n",path); exit(1); }
-    fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
-    U8 *data=malloc(fsz); fread(data,1,fsz,f); fclose(f);
-
-    BHdr   *hdr   =(BHdr*)  (data+0);
-    assert(hdr->magic==BSP_MAGIC && hdr->ver==BSP_VER);
-    BVtx   *bv    =(BVtx*)  (data+hdr->lumps[BSP_VERTS].ofs);
-    U32     nbv   =(U32)    (hdr->lumps[BSP_VERTS].len/sizeof(BVtx));
-    I32    *bi    =(I32*)   (data+hdr->lumps[BSP_IDXS].ofs);
-    BFace  *bf    =(BFace*) (data+hdr->lumps[BSP_FACES].ofs);
-    U32     nbf   =(U32)    (hdr->lumps[BSP_FACES].len/sizeof(BFace));
-    BShd   *bs    =(BShd*)  (data+hdr->lumps[BSP_SHADERS].ofs);
-    U32     nbs   =(U32)    (hdr->lumps[BSP_SHADERS].len/sizeof(BShd));
-
-    /* build lightmap atlas */
-    U32 lm_lump_sz = (U32)hdr->lumps[BSP_LIGHTMAPS].len;
-    U32 n_lm = lm_lump_sz / (LM_SIZE * LM_SIZE * 3);
-    U32 n_lm_total = n_lm + 1; /* +1 for white fallback page */
-    U32 lm_cols = 1, lm_rows = 1;
-    U8 *lm_atlas = NULL;
-    U32 lm_aw = 0, lm_ah = 0;
-    F32 white_u = 0.5f, white_v = 0.5f;
-
-    if (n_lm > 0) {
-        while (lm_cols * lm_cols < n_lm_total) lm_cols++;
-        lm_rows = (n_lm_total + lm_cols - 1) / lm_cols;
-        lm_aw = lm_cols * LM_SIZE; lm_ah = lm_rows * LM_SIZE;
-        lm_atlas = calloc(lm_aw * lm_ah * 4, 1);
-        const U8 *lmd = data + hdr->lumps[BSP_LIGHTMAPS].ofs;
-        for (U32 pg = 0; pg < n_lm; pg++) {
-            U32 cx = pg % lm_cols, cy = pg / lm_cols;
-            const U8 *src = lmd + pg * LM_SIZE * LM_SIZE * 3;
-            for (U32 y = 0; y < LM_SIZE; y++)
-                for (U32 x = 0; x < LM_SIZE; x++) {
-                    U32 d = ((cy*LM_SIZE+y)*lm_aw + cx*LM_SIZE+x)*4;
-                    U32 s = (y*LM_SIZE+x)*3;
-                    lm_atlas[d]=src[s]; lm_atlas[d+1]=src[s+1];
-                    lm_atlas[d+2]=src[s+2]; lm_atlas[d+3]=255;
-                }
-        }
-        /* white fallback page */
-        U32 wcx = n_lm % lm_cols, wcy = n_lm / lm_cols;
-        for (U32 y = 0; y < LM_SIZE; y++)
-            for (U32 x = 0; x < LM_SIZE; x++) {
-                U32 d = ((wcy*LM_SIZE+y)*lm_aw + wcx*LM_SIZE+x)*4;
-                lm_atlas[d]=lm_atlas[d+1]=lm_atlas[d+2]=lm_atlas[d+3]=255;
-            }
-        white_u = ((F32)wcx + 0.5f) / (F32)lm_cols;
-        white_v = ((F32)wcy + 0.5f) / (F32)lm_rows;
-        printf("[lm] %u pages → %ux%u atlas (%u cols)\n", n_lm, lm_aw, lm_ah, lm_cols);
-    }
-
-    U32 nv=nbv; Vtx *verts=malloc(sizeof(Vtx)*nv);
-    for (U32 i=0;i<nv;i++) verts[i]=bvtx_conv(&bv[i]);
-
-    U32 *idxs=NULL, *tex_ids=NULL, ni=0, tc=0;
-    for (U32 fi=0;fi<nbf;fi++) {
-        const BFace *face=&bf[fi];
-        if (face->type==MST_PLANAR||face->type==MST_MESH) {
-            U32 ft = (U32)(face->ni / 3);
-            idxs=realloc(idxs,sizeof(U32)*(ni+face->ni));
-            tex_ids=realloc(tex_ids,sizeof(U32)*(tc+ft));
-            for (I32 i=0;i<face->ni;i++)
-                idxs[ni+i]=(U32)(face->fv+bi[face->fi+i]);
-            for (U32 t=0;t<ft;t++) tex_ids[tc+t]=(U32)face->shd;
-            ni+=face->ni; tc+=ft;
-            /* transform lightmap UVs → atlas space */
-            if (face->lm >= 0 && lm_cols > 0) {
-                F32 cx = (F32)((U32)face->lm % lm_cols);
-                F32 cy = (F32)((U32)face->lm / lm_cols);
-                for (I32 i=0;i<face->nv;i++) {
-                    U32 vi=(U32)(face->fv+i);
-                    verts[vi]._q[0]=(cx+verts[vi]._q[0])/(F32)lm_cols;
-                    verts[vi]._q[1]=(cy+verts[vi]._q[1])/(F32)lm_rows;
-                }
-            } else {
-                for (I32 i=0;i<face->nv;i++) {
-                    U32 vi=(U32)(face->fv+i);
-                    verts[vi]._q[0]=white_u; verts[vi]._q[1]=white_v;
-                }
-            }
-        } else if (face->type==MST_PATCH) {
-            U32 old_nv=nv, old_tc=tc;
-            tc+=bsp_tess_patch(&bv[face->fv],face->pw,face->ph,
-                               &verts,&nv,&idxs,&ni);
-            U32 patch_tris=tc-old_tc;
-            tex_ids=realloc(tex_ids,sizeof(U32)*tc);
-            for (U32 t=0;t<patch_tris;t++) tex_ids[old_tc+t]=(U32)face->shd;
-            /* transform patch lightmap UVs → atlas space */
-            if (face->lm >= 0 && lm_cols > 0) {
-                F32 cx = (F32)((U32)face->lm % lm_cols);
-                F32 cy = (F32)((U32)face->lm / lm_cols);
-                for (U32 vi=old_nv;vi<nv;vi++) {
-                    verts[vi]._q[0]=(cx+verts[vi]._q[0])/(F32)lm_cols;
-                    verts[vi]._q[1]=(cy+verts[vi]._q[1])/(F32)lm_rows;
-                }
-            } else {
-                for (U32 vi=old_nv;vi<nv;vi++) {
-                    verts[vi]._q[0]=white_u; verts[vi]._q[1]=white_v;
-                }
-            }
-        }
-    }
-
-    U32 nm=nbs;
-    V4 *mats=malloc(sizeof(V4)*nm);
-    char (*tnames)[64]=malloc(sizeof(char[64])*nm);
-    for (U32 i=0;i<nm;i++) {
-        U32 h=5381; for (int c=0;bs[i].name[c];c++) h=h*31+(U8)bs[i].name[c];
-        mats[i]=(V4){0.4f+0.35f*((h>>0&0xFF)/255.f),
-                     0.4f+0.35f*((h>>8&0xFF)/255.f),
-                     0.4f+0.35f*((h>>16&0xFF)/255.f),1};
-        memcpy(tnames[i], bs[i].name, 64);
-    }
-
-    if (out_spawn) *out_spawn = bsp_find_spawn(data, hdr);
-
-    /* load collision data (planes, nodes, leafs, brushes, brush sides) */
-    if (out_col) {
-        ColMap *cm = out_col;
-        memset(cm, 0, sizeof(*cm));
-        /* planes: {float normal[3], float dist} = 16 bytes */
-        cm->n_planes = (U32)hdr->lumps[BSP_PLANES].len / 16;
-        cm->planes = malloc(sizeof(CPlane) * cm->n_planes);
-        for (U32 i = 0; i < cm->n_planes; i++) {
-            const F32 *p = (const F32*)(data + hdr->lumps[BSP_PLANES].ofs + i*16);
-            cm->planes[i].normal[0] = p[0];
-            cm->planes[i].normal[1] = p[2];
-            cm->planes[i].normal[2] = -p[1];
-            cm->planes[i].dist = p[3];
-            F32 *n = cm->planes[i].normal;
-            /* only positive axials use the shortcut (t1=p1[type]-dist) —
-               after Y-up swizzle, negative axials must use the general path */
-            cm->planes[i].type = (n[0]==1.f) ? 0 : (n[1]==1.f) ? 1 :
-                                  (n[2]==1.f) ? 2 : 3;
-            cm->planes[i].signbits = (U8)((n[0]<0) | ((n[1]<0)<<1) | ((n[2]<0)<<2));
-        }
-        /* nodes: {int plane, children[2], mins[3], maxs[3]} = 36 bytes */
-        cm->n_nodes = (U32)hdr->lumps[BSP_NODES].len / 36;
-        cm->nodes = malloc(sizeof(CNode) * cm->n_nodes);
-        for (U32 i = 0; i < cm->n_nodes; i++) {
-            const I32 *nd = (const I32*)(data + hdr->lumps[BSP_NODES].ofs + i*36);
-            cm->nodes[i].plane = nd[0];
-            cm->nodes[i].children[0] = nd[1];
-            cm->nodes[i].children[1] = nd[2];
-        }
-        /* leafs: 48 bytes each */
-        cm->n_leafs = (U32)hdr->lumps[BSP_LEAFS].len / 48;
-        cm->leafs = malloc(sizeof(CLeaf) * cm->n_leafs);
-        for (U32 i = 0; i < cm->n_leafs; i++) {
-            const I32 *lf = (const I32*)(data + hdr->lumps[BSP_LEAFS].ofs + i*48);
-            cm->leafs[i].cluster = lf[0];
-            cm->leafs[i].area = lf[1];
-            cm->leafs[i].first_surf = lf[8];
-            cm->leafs[i].n_surfs = lf[9];
-            cm->leafs[i].first_brush = lf[10];
-            cm->leafs[i].n_brushes = lf[11];
-        }
-        /* leaf brushes: int[] */
-        cm->n_leaf_brushes = (U32)hdr->lumps[BSP_LEAFBRUSHES].len / 4;
-        cm->leaf_brushes = malloc(sizeof(I32) * cm->n_leaf_brushes);
-        memcpy(cm->leaf_brushes, data + hdr->lumps[BSP_LEAFBRUSHES].ofs,
-               sizeof(I32) * cm->n_leaf_brushes);
-        /* brushes: {int first_side, n_sides, shader} = 12 bytes */
-        cm->n_brushes = (U32)hdr->lumps[BSP_BRUSHES].len / 12;
-        cm->brushes = malloc(sizeof(CBrush) * cm->n_brushes);
-        for (U32 i = 0; i < cm->n_brushes; i++) {
-            const I32 *br = (const I32*)(data + hdr->lumps[BSP_BRUSHES].ofs + i*12);
-            cm->brushes[i].first_side = br[0];
-            cm->brushes[i].n_sides = br[1];
-            cm->brushes[i].shader = br[2];
-        }
-        /* brush sides: {int plane, shader} = 8 bytes */
-        cm->n_sides = (U32)hdr->lumps[BSP_BRUSHSIDES].len / 8;
-        cm->sides = malloc(sizeof(CBrushSide) * cm->n_sides);
-        for (U32 i = 0; i < cm->n_sides; i++) {
-            const I32 *bs2 = (const I32*)(data + hdr->lumps[BSP_BRUSHSIDES].ofs + i*8);
-            cm->sides[i].plane = bs2[0];
-            cm->sides[i].shader = bs2[1];
-        }
-        /* shader contents flags */
-        cm->shd_contents = malloc(sizeof(I32) * nbs);
-        for (U32 i = 0; i < nbs; i++) cm->shd_contents[i] = bs[i].contents;
-        /* per-brush checkcount for trace dedup */
-        cm->brush_check = calloc(cm->n_brushes, sizeof(U32));
-        cm->check = 0;
-        printf("[col] %u planes, %u nodes, %u leafs, %u brushes, %u sides\n",
-               cm->n_planes, cm->n_nodes, cm->n_leafs, cm->n_brushes, cm->n_sides);
-    }
-
-    free(data);
-    printf("[bsp] %s: %u verts, %u tris, %u shaders\n",path,nv,tc,nbs);
-    return (Scene){.verts=verts,.nv=nv,.idxs=idxs,.ni=ni,
-                   .mats=mats,.nm=nm,.tex_ids=tex_ids,
-                   .tex_names=tnames,.tri_count=tc,
-                   .lm_atlas=lm_atlas,.lm_w=lm_aw,.lm_h=lm_ah};
-}
-
-/* <<bsp-entities>> ====================================================== */
-
-static Spawn bsp_find_spawn(const U8 *data, const BHdr *hdr) {
-    const char *ents = (const char*)(data + hdr->lumps[BSP_ENTITIES].ofs);
-    I32 len = hdr->lumps[BSP_ENTITIES].len;
-    Spawn sp = {.origin={0,0,0}, .angle=0};
-
-    const char *p = ents, *end = ents + len;
-    while (p < end) {
-        /* find opening brace */
-        while (p < end && *p != '{') p++;
-        if (p >= end) break;
-        p++;
-
-        int is_spawn = 0;
-        V3 org = {0,0,0}; F32 ang = 0;
-        int has_origin = 0;
-
-        while (p < end && *p != '}') {
-            /* skip whitespace */
-            while (p < end && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
-            if (p >= end || *p == '}') break;
-
-            /* read key */
-            if (*p != '"') { p++; continue; }
-            p++;
-            const char *key = p;
-            while (p < end && *p != '"') p++;
-            int klen = (int)(p - key);
-            if (p < end) p++;
-
-            /* skip whitespace */
-            while (p < end && (*p==' '||*p=='\t')) p++;
-
-            /* read value */
-            if (p >= end || *p != '"') continue;
-            p++;
-            const char *val = p;
-            while (p < end && *p != '"') p++;
-            int vlen = (int)(p - val);
-            if (p < end) p++;
-
-            if (klen==9 && memcmp(key,"classname",9)==0 &&
-                vlen==22 && memcmp(val,"info_player_deathmatch",22)==0)
-                is_spawn = 1;
-            if (klen==6 && memcmp(key,"origin",6)==0) {
-                char buf[64]; int n=vlen<63?vlen:63;
-                memcpy(buf,val,n); buf[n]=0;
-                sscanf(buf,"%f %f %f",&org.x,&org.y,&org.z);
-                has_origin = 1;
-            }
-            if (klen==5 && memcmp(key,"angle",5)==0) {
-                char buf[32]; int n=vlen<31?vlen:31;
-                memcpy(buf,val,n); buf[n]=0;
-                sscanf(buf,"%f",&ang);
-            }
-        }
-        if (is_spawn && has_origin) {
-            /* Q3 Z-up → Y-up: (x,y,z) → (x,z,-y) — player origin */
-            sp.origin = v3(org.x, org.z, -org.y);
-            sp.angle = ang;
-            printf("[bsp] spawn: %.0f %.0f %.0f angle %.0f\n",
-                   sp.origin.x, sp.origin.y, sp.origin.z, ang);
-            return sp;
-        }
-        if (p < end) p++; /* skip '}' */
-    }
-    printf("[bsp] no spawn found, using origin\n");
-    return sp;
-}
-
-/* <<collision>> ========================================================= */
-
+// Capsule collision shape: a sphere swept along a vertical segment
 typedef struct {
-    F32 fraction;
-    V3  endpos;
-    V3  normal;
-    int startsolid, allsolid;
-} Trace;
+  int Use_Capsule;   // Non-zero to use capsule collision instead of AABB
+  F32 Radius;        // Radius of the capsule's hemispheres and cylinder
+  F32 Half_Height;   // Half the height of the cylindrical body (center to hemisphere center)
+  V3  Offset;        // Offset from the AABB center to the capsule's midpoint
+} Trace_Sphere;
 
+// Working state for a single collision trace through the BSP tree
 typedef struct {
-    int use;       /* 0=AABB, 1=capsule */
-    F32 radius;    /* hemisphere radius */
-    F32 halfheight;
-    V3  offset;    /* (0, halfheight-radius, 0) in Y-up */
-} Sphere;
+  V3           Start, End;      // World-space start and end points of the trace
+  V3           Extents;         // Half-extents of the bounding box for broad-phase testing
+  V3           Offsets[8];      // Eight AABB corner offsets for plane-side testing
+  Trace_Result Result;          // Accumulated trace result (nearest hit so far)
+  int          Is_Point;        // Non-zero if the trace is a zero-volume point trace
+  Trace_Sphere Sphere;          // Capsule shape parameters (when Use_Capsule is set)
+} Trace_Work;
 
-typedef struct {
-    V3    start, end;
-    V3    extents;
-    V3    offsets[8];
-    Trace trace;
-    int   isPoint;
-    Sphere sphere;
-} TraceWork;
+/* Test a moving AABB or capsule against a single convex brush (intersection of half-spaces).
+   Uses the separating-axis theorem: track the latest entry and earliest exit across all planes.
+   If the brush starts solid, mark the result accordingly. */
 
-static void cm_trace_brush(TraceWork *tw, const CBrush *brush, const ColMap *cm) {
-    if (brush->n_sides <= 0) return;
+void Trace_Against_Brush (Trace_Work *Work, const Collision_Brush *Brush, const Collision_Map *Collision) {
+  if (Brush->Side_Count <= 0) return;
 
-    F32 enterFrac = -1.f, leaveFrac = 1.f;
-    const CPlane *clipplane = NULL;
-    int getout = 0, startout = 0;
+  F32 Enter_Fraction = -1.f;
+  F32 Leave_Fraction =  1.f;
+  const Collision_Plane *Clip_Plane = NULL;
+  int Gets_Out   = 0;
+  int Starts_Out = 0;
 
-    for (I32 i = 0; i < brush->n_sides; i++) {
-        const CBrushSide *side = &cm->sides[brush->first_side + i];
-        const CPlane *plane = &cm->planes[side->plane];
+  // Test the trace segment against each bounding plane of the brush
+  for (I32 Side = 0; Side < Brush->Side_Count; Side++) {
+    const Collision_Brush_Side *Brush_Side = &Collision->Sides[Brush->First_Side + Side];
+    const Collision_Plane *Plane           = &Collision->Planes[Brush_Side->Plane_Index];
 
-        F32 dist, d1, d2;
-        if (tw->sphere.use) {
-            /* capsule: expand plane by radius, trace from nearest sphere center */
-            dist = plane->dist + tw->sphere.radius;
-            F32 t = plane->normal[0] * tw->sphere.offset.x +
-                    plane->normal[1] * tw->sphere.offset.y +
-                    plane->normal[2] * tw->sphere.offset.z;
-            V3 sp, ep;
-            if (t > 0) {
-                sp = v3sub(tw->start, tw->sphere.offset);
-                ep = v3sub(tw->end,   tw->sphere.offset);
-            } else {
-                sp = v3add(tw->start, tw->sphere.offset);
-                ep = v3add(tw->end,   tw->sphere.offset);
-            }
-            d1 = sp.x*plane->normal[0] + sp.y*plane->normal[1] +
-                 sp.z*plane->normal[2] - dist;
-            d2 = ep.x*plane->normal[0] + ep.y*plane->normal[1] +
-                 ep.z*plane->normal[2] - dist;
-        } else if (tw->isPoint) {
-            dist = plane->dist;
-            d1 = tw->start.x*plane->normal[0] + tw->start.y*plane->normal[1] +
-                 tw->start.z*plane->normal[2] - dist;
-            d2 = tw->end.x*plane->normal[0] + tw->end.y*plane->normal[1] +
-                 tw->end.z*plane->normal[2] - dist;
-        } else {
-            const V3 *ofs = &tw->offsets[plane->signbits];
-            dist = plane->dist - (((F32*)ofs)[0] * plane->normal[0] +
-                                   ((F32*)ofs)[1] * plane->normal[1] +
-                                   ((F32*)ofs)[2] * plane->normal[2]);
-            d1 = tw->start.x*plane->normal[0] + tw->start.y*plane->normal[1] +
-                 tw->start.z*plane->normal[2] - dist;
-            d2 = tw->end.x*plane->normal[0] + tw->end.y*plane->normal[1] +
-                 tw->end.z*plane->normal[2] - dist;
-        }
+    // Compute the signed distance from the trace start and end to the offset plane
+    F32 Distance, Distance_Start, Distance_End;
 
-        if (d2 > 0) getout = 1;
-        if (d1 > 0) startout = 1;
+    // Dispatch on the trace shape to compute plane distances
+    if (Work->Sphere.Use_Capsule) {
 
-        if (d1 > 0 && (d2 >= SURF_CLIP_EPS || d2 >= d1)) continue;
-        if (d1 <= 0 && d2 <= 0) continue;
+      // For capsule traces, offset the plane by the sphere radius and project the sphere center
+      Distance = Plane->Distance + Work->Sphere.Radius;
+      F32 Offset_Projection = Plane->Normal[0] * Work->Sphere.Offset.x
+                            + Plane->Normal[1] * Work->Sphere.Offset.y
+                            + Plane->Normal[2] * Work->Sphere.Offset.z;
+      V3 Sphere_Start, Sphere_End;
+      if (Offset_Projection > 0) {
+        Sphere_Start = V3_Subtract (Work->Start, Work->Sphere.Offset);
+        Sphere_End   = V3_Subtract (Work->End,   Work->Sphere.Offset);
+      } else {
+        Sphere_Start = V3_Add (Work->Start, Work->Sphere.Offset);
+        Sphere_End   = V3_Add (Work->End,   Work->Sphere.Offset);
+      }
+      Distance_Start = Sphere_Start.x * Plane->Normal[0] + Sphere_Start.y * Plane->Normal[1] + Sphere_Start.z * Plane->Normal[2] - Distance;
+      Distance_End   = Sphere_End.x   * Plane->Normal[0] + Sphere_End.y   * Plane->Normal[1] + Sphere_End.z   * Plane->Normal[2] - Distance;
 
-        if (d1 > d2) { /* entering */
-            F32 f = (d1 - SURF_CLIP_EPS) / (d1 - d2);
-            if (f < 0) f = 0;
-            if (f > enterFrac) { enterFrac = f; clipplane = plane; }
-        } else { /* leaving */
-            F32 f = (d1 + SURF_CLIP_EPS) / (d1 - d2);
-            if (f > 1) f = 1;
-            if (f < leaveFrac) leaveFrac = f;
-        }
-    }
+    // Point trace: no extent offset needed
+    } else if (Work->Is_Point) {
+      Distance       = Plane->Distance;
+      Distance_Start = Work->Start.x * Plane->Normal[0] + Work->Start.y * Plane->Normal[1] + Work->Start.z * Plane->Normal[2] - Distance;
+      Distance_End   = Work->End.x   * Plane->Normal[0] + Work->End.y   * Plane->Normal[1] + Work->End.z   * Plane->Normal[2] - Distance;
 
-    if (!startout) {
-        tw->trace.startsolid = 1;
-        if (!getout) tw->trace.allsolid = 1;
-        tw->trace.fraction = 0;
-        return;
-    }
-
-    if (enterFrac < leaveFrac && enterFrac > -1 && enterFrac < tw->trace.fraction) {
-        if (enterFrac < 0) enterFrac = 0;
-        tw->trace.fraction = enterFrac;
-        tw->trace.normal = v3(clipplane->normal[0], clipplane->normal[1],
-                              clipplane->normal[2]);
-    }
-}
-
-static void cm_trace_leaf(TraceWork *tw, const CLeaf *leaf, ColMap *cm) {
-    for (I32 k = 0; k < leaf->n_brushes; k++) {
-        I32 bi = cm->leaf_brushes[leaf->first_brush + k];
-        if ((U32)bi >= cm->n_brushes) continue;
-        if (cm->brush_check[bi] == cm->check) continue;
-        cm->brush_check[bi] = cm->check;
-        const CBrush *b = &cm->brushes[bi];
-        if (!(cm->shd_contents[b->shader] & CONTENTS_SOLID)) continue;
-        cm_trace_brush(tw, b, cm);
-        if (tw->trace.fraction == 0.f) return;
-    }
-}
-
-static void cm_trace_tree(TraceWork *tw, int num, F32 p1f, F32 p2f,
-                           V3 p1, V3 p2, ColMap *cm) {
-    if (tw->trace.fraction <= p1f) return;
-
-    if (num < 0) {
-        cm_trace_leaf(tw, &cm->leafs[-(num + 1)], cm);
-        return;
-    }
-
-    const CNode *node = &cm->nodes[num];
-    const CPlane *plane = &cm->planes[node->plane];
-
-    F32 t1, t2, offset;
-
-    if (plane->type < 3) {
-        t1 = ((F32*)&p1)[plane->type] - plane->dist;
-        t2 = ((F32*)&p2)[plane->type] - plane->dist;
-        offset = ((F32*)&tw->extents)[plane->type];
+    // AABB trace: use the sign-bits-indexed corner to maximize the offset
     } else {
-        V3 pn = v3(plane->normal[0], plane->normal[1], plane->normal[2]);
-        t1 = v3dot(p1, pn) - plane->dist;
-        t2 = v3dot(p2, pn) - plane->dist;
-        if (tw->isPoint) {
-            offset = 0;
-        } else {
-            offset = fabsf(tw->extents.x * plane->normal[0]) +
-                     fabsf(tw->extents.y * plane->normal[1]) +
-                     fabsf(tw->extents.z * plane->normal[2]);
-        }
+      const V3 *Corner = &Work->Offsets[Plane->Sign_Bits];
+      Distance       = Plane->Distance - (((F32 *)Corner)[0] * Plane->Normal[0] + ((F32 *)Corner)[1] * Plane->Normal[1] + ((F32 *)Corner)[2] * Plane->Normal[2]);
+      Distance_Start = Work->Start.x * Plane->Normal[0] + Work->Start.y * Plane->Normal[1] + Work->Start.z * Plane->Normal[2] - Distance;
+      Distance_End   = Work->End.x   * Plane->Normal[0] + Work->End.y   * Plane->Normal[1] + Work->End.z   * Plane->Normal[2] - Distance;
     }
 
-    if (t1 >= offset + 1 && t2 >= offset + 1) {
-        cm_trace_tree(tw, node->children[0], p1f, p2f, p1, p2, cm);
-        return;
-    }
-    if (t1 < -offset - 1 && t2 < -offset - 1) {
-        cm_trace_tree(tw, node->children[1], p1f, p2f, p1, p2, cm);
-        return;
-    }
+    // Update the entry and exit fractions based on the signed distances
+    if (Distance_End > 0)   Gets_Out   = 1;
+    if (Distance_Start > 0) Starts_Out = 1;
 
-    int side;
-    F32 frac1, frac2;
+    // If the start is in front and the end is also in front (or on the same side), this plane does not clip
+    if (Distance_Start > 0 and (Distance_End >= SURFACE_CLIP_EPSILON or Distance_End >= Distance_Start))
+      continue;
 
-    if (t1 < t2) {
-        F32 idist = 1.f / (t1 - t2);
-        side = 1;
-        frac2 = (t1 + offset + SURF_CLIP_EPS) * idist;
-        frac1 = (t1 - offset + SURF_CLIP_EPS) * idist;
-    } else if (t1 > t2) {
-        F32 idist = 1.f / (t1 - t2);
-        side = 0;
-        frac2 = (t1 - offset - SURF_CLIP_EPS) * idist;
-        frac1 = (t1 + offset + SURF_CLIP_EPS) * idist;
+    // If both start and end are behind this plane, it does not contribute to clipping
+    if (Distance_Start <= 0 and Distance_End <= 0)
+      continue;
+
+    // Compute the entry or exit fraction with an epsilon nudge for numerical stability
+    if (Distance_Start > Distance_End) {
+      F32 Fraction = (Distance_Start - SURFACE_CLIP_EPSILON) / (Distance_Start - Distance_End);
+      if (Fraction < 0) Fraction = 0;
+      if (Fraction > Enter_Fraction) {
+        Enter_Fraction = Fraction;
+        Clip_Plane     = Plane;
+      }
     } else {
-        side = 0;
-        frac1 = 1.f;
-        frac2 = 0.f;
+      F32 Fraction = (Distance_Start + SURFACE_CLIP_EPSILON) / (Distance_Start - Distance_End);
+      if (Fraction > 1) Fraction = 1;
+      if (Fraction < Leave_Fraction)
+        Leave_Fraction = Fraction;
     }
+  }
 
-    if (frac1 < 0) frac1 = 0;
-    if (frac1 > 1) frac1 = 1;
-    if (frac2 < 0) frac2 = 0;
-    if (frac2 > 1) frac2 = 1;
+  // If the trace started inside all planes, the start position is embedded in solid
+  if (not Starts_Out) {
+    Work->Result.Start_Solid = 1;
+    if (not Gets_Out) Work->Result.All_Solid = 1;
+    Work->Result.Fraction = 0;
+    return;
+  }
 
-    {
-        F32 midf = p1f + (p2f - p1f) * frac1;
-        V3 mid = v3add(p1, v3scale(v3sub(p2, p1), frac1));
-        cm_trace_tree(tw, node->children[side], p1f, midf, p1, mid, cm);
-    }
-    {
-        F32 midf = p1f + (p2f - p1f) * frac2;
-        V3 mid = v3add(p1, v3scale(v3sub(p2, p1), frac2));
-        cm_trace_tree(tw, node->children[side ^ 1], midf, p2f, mid, p2, cm);
-    }
+  // If the entry fraction is before the exit and closer than any previous hit, record this collision
+  if (Enter_Fraction < Leave_Fraction and Enter_Fraction > -1 and Enter_Fraction < Work->Result.Fraction) {
+    if (Enter_Fraction < 0) Enter_Fraction = 0;
+    Work->Result.Fraction = Enter_Fraction;
+    Work->Result.Normal   = V3_Make (Clip_Plane->Normal[0], Clip_Plane->Normal[1], Clip_Plane->Normal[2]);
+  }
 }
 
-/* sphere-ray intersection: |start + t*dir - origin|² = radius² */
-static void cm_trace_sphere(TraceWork *tw, V3 origin, F32 radius,
-                             V3 start, V3 end) {
-    V3 dir = v3sub(end, start);
-    F32 len = sqrtf(v3dot(dir, dir));
-    if (len < 1e-6f) {
-        /* zero-length trace: just test containment */
-        V3 d = v3sub(start, origin);
-        if (v3dot(d, d) <= radius * radius) {
-            tw->trace.startsolid = 1;
-            tw->trace.allsolid = 1;
-            tw->trace.fraction = 0;
-        }
-        return;
-    }
-    dir = v3scale(dir, 1.f / len);
-    V3 v1 = v3sub(start, origin);
-    F32 b = 2.f * v3dot(dir, v1);
-    F32 c = v3dot(v1, v1) - radius * radius;
-    F32 d = b * b - 4.f * c;
-    if (d <= 0) return;
-    F32 sqrtd = sqrtf(d);
-    F32 frac = (-b - sqrtd) * 0.5f;
-    if (frac < 0) {
-        /* start is inside sphere */
-        tw->trace.startsolid = 1;
-        frac = (-b + sqrtd) * 0.5f;
-        if (frac < 0) { tw->trace.allsolid = 1; tw->trace.fraction = 0; return; }
-        return;
-    }
-    frac /= len; /* convert from ray-param to fraction of original segment */
-    if (frac < tw->trace.fraction) {
-        tw->trace.fraction = frac < 0 ? 0 : frac;
-        V3 hit = v3add(start, v3scale(v3sub(end, start), frac));
-        tw->trace.normal = v3norm(v3sub(hit, origin));
-    }
+/* Test the trace against all solid brushes referenced by a BSP leaf, skipping brushes
+   that have already been tested during this trace (via the check counter). */
+
+void Trace_Against_Leaf (Trace_Work *Work, const Collision_Leaf *Leaf, Collision_Map *Collision) {
+  for (I32 Loop = 0; Loop < Leaf->Brush_Count; Loop++) {
+    I32 Brush_Index = Collision->Leaf_Brushes[Leaf->First_Brush + Loop];
+    if ((U32)Brush_Index >= Collision->Brush_Count) continue;
+
+    // Skip brushes already tested in this trace pass
+    if (Collision->Brush_Checks[Brush_Index] == Collision->Check_Counter) continue;
+    Collision->Brush_Checks[Brush_Index] = Collision->Check_Counter;
+
+    // Only test brushes whose shader has the CONTENTS_SOLID flag
+    const Collision_Brush *Brush = &Collision->Brushes[Brush_Index];
+    if (not (Collision->Shader_Contents[Brush->Shader_Index] & CONTENTS_SOLID)) continue;
+
+    // Test the trace against this brush if it hasn't been checked this frame
+    Trace_Against_Brush (Work, Brush, Collision);
+    if (Work->Result.Fraction == 0.f) return;
+  }
 }
 
-/* vertical cylinder intersection (2D circle test, clamped to height range) */
-static void cm_trace_vert_cylinder(TraceWork *tw, V3 origin, F32 radius,
-                                    F32 halfheight, V3 start, V3 end) {
-    /* project to XZ plane (Y-up) */
-    F32 dx = end.x - start.x, dz = end.z - start.z;
-    F32 sx = start.x - origin.x, sz = start.z - origin.z;
-    F32 a = dx*dx + dz*dz;
-    if (a < 1e-12f) return; /* no horizontal movement */
-    F32 b = 2.f * (sx*dx + sz*dz);
-    F32 c = sx*sx + sz*sz - radius * radius;
-    F32 disc = b*b - 4.f*a*c;
-    if (disc <= 0) return;
-    F32 sqrtd = sqrtf(disc);
-    F32 t = (-b - sqrtd) / (2.f * a);
-    if (t < 0 || t >= tw->trace.fraction) return;
-    /* check Y is within cylinder height at intersection */
-    F32 iy = start.y + t * (end.y - start.y);
-    if (iy < origin.y - halfheight || iy > origin.y + halfheight) return;
-    tw->trace.fraction = t;
-    /* normal is horizontal, pointing outward from cylinder axis */
-    F32 hx = start.x + t * dx - origin.x;
-    F32 hz = start.z + t * dz - origin.z;
-    F32 hlen = sqrtf(hx*hx + hz*hz);
-    if (hlen > 1e-6f) tw->trace.normal = v3(hx/hlen, 0, hz/hlen);
-}
+/* Recursively traverse the BSP tree, splitting the trace segment at each node plane.
+   When a leaf is reached, test against its brushes.  Early-out if a previous hit
+   is closer than the current node's range. */
 
-/* capsule-vs-capsule: cylinder + two sphere tests (for entity-entity collision) */
-static void __attribute__((unused)) cm_trace_capsule_capsule(TraceWork *tw,
-    V3 origin, F32 radius, F32 halfheight, F32 offs,
-    V3 start, V3 end) {
-    /* expand radius by moving capsule's radius */
-    F32 r = radius + tw->sphere.radius;
-    /* cylinder test for the horizontal contact region */
-    F32 h = halfheight + tw->sphere.halfheight - r;
-    if (h > 0)
-        cm_trace_vert_cylinder(tw, origin, r, h, start, end);
-    /* top sphere of static capsule vs bottom sphere of moving capsule */
-    V3 top = v3add(origin, v3(0, offs, 0));
-    cm_trace_sphere(tw, top, r,
-                    v3sub(start, tw->sphere.offset),
-                    v3sub(end, tw->sphere.offset));
-    /* bottom sphere of static capsule vs top sphere of moving capsule */
-    V3 bot = v3sub(origin, v3(0, offs, 0));
-    cm_trace_sphere(tw, bot, r,
-                    v3add(start, tw->sphere.offset),
-                    v3add(end, tw->sphere.offset));
-}
+void Trace_Through_Tree (Trace_Work *Work, int Node_Index, F32 Start_Fraction, F32 End_Fraction,
+                                V3 Point_Start, V3 Point_End, Collision_Map *Collision) {
 
-static Trace cm_trace(V3 start, V3 end, V3 mins, V3 maxs, ColMap *cm, int capsule) {
-    TraceWork tw;
-    memset(&tw, 0, sizeof(tw));
-    tw.start = start;
-    tw.end = end;
-    tw.trace.fraction = 1.f;
+  // Early-out: a closer hit has already been found
+  if (Work->Result.Fraction <= Start_Fraction) return;
 
-    tw.extents = v3((-mins.x > maxs.x ? -mins.x : maxs.x),
-                    (-mins.y > maxs.y ? -mins.y : maxs.y),
-                    (-mins.z > maxs.z ? -mins.z : maxs.z));
+  // Leaf node: test against the leaf's brushes
+  if (Node_Index < 0) {
+    Trace_Against_Leaf (Work, &Collision->Leafs[-(Node_Index + 1)], Collision);
+    return;
+  }
 
-    tw.isPoint = (mins.x == 0 && mins.y == 0 && mins.z == 0 &&
-                  maxs.x == 0 && maxs.y == 0 && maxs.z == 0);
+  const Collision_Node  *Node  = &Collision->Nodes[Node_Index];
+  const Collision_Plane *Plane = &Collision->Planes[Node->Plane_Index];
 
-    tw.sphere.use = capsule && !tw.isPoint;
-    if (tw.sphere.use) {
-        F32 hw = maxs.x, hh = maxs.y;
-        tw.sphere.radius = hw < hh ? hw : hh;
-        tw.sphere.halfheight = hh;
-        tw.sphere.offset = v3(0, hh - tw.sphere.radius, 0);
-    }
+  F32 Distance_Start, Distance_End, Offset;
 
-    for (int i = 0; i < 8; i++) {
-        tw.offsets[i] = v3((i & 1) ? maxs.x : mins.x,
-                           (i & 2) ? maxs.y : mins.y,
-                           (i & 4) ? maxs.z : mins.z);
-    }
-
-    cm->check++;
-    cm_trace_tree(&tw, 0, 0.f, 1.f, tw.start, tw.end, cm);
-
-    if (tw.trace.fraction == 1.f) {
-        tw.trace.endpos = end;
+  // For axis-aligned planes, use direct component access for speed
+  if (Plane->Type < 3) {
+    Distance_Start = ((F32 *)&Point_Start)[Plane->Type] - Plane->Distance;
+    Distance_End   = ((F32 *)&Point_End)[Plane->Type]   - Plane->Distance;
+    Offset         = ((F32 *)&Work->Extents)[Plane->Type];
+  } else {
+    V3 Plane_Normal = V3_Make (Plane->Normal[0], Plane->Normal[1], Plane->Normal[2]);
+    Distance_Start  = V3_Dot (Point_Start, Plane_Normal) - Plane->Distance;
+    Distance_End    = V3_Dot (Point_End,   Plane_Normal) - Plane->Distance;
+    if (Work->Is_Point) {
+      Offset = 0;
     } else {
-        tw.trace.endpos = v3add(start, v3scale(v3sub(end, start), tw.trace.fraction));
+      Offset = fabsf (Work->Extents.x * Plane->Normal[0])
+             + fabsf (Work->Extents.y * Plane->Normal[1])
+             + fabsf (Work->Extents.z * Plane->Normal[2]);
     }
+  }
 
-    return tw.trace;
+  // If the entire segment is on the front side of the plane, recurse into the front child only
+  if (Distance_Start >= Offset + 1 and Distance_End >= Offset + 1) {
+    Trace_Through_Tree (Work, Node->Children[0], Start_Fraction, End_Fraction, Point_Start, Point_End, Collision);
+    return;
+  }
+
+  // If the entire segment is on the back side, recurse into the back child only
+  if (Distance_Start < -Offset - 1 and Distance_End < -Offset - 1) {
+    Trace_Through_Tree (Work, Node->Children[1], Start_Fraction, End_Fraction, Point_Start, Point_End, Collision);
+    return;
+  }
+
+  // The segment straddles the plane; compute the near and far split fractions
+  int Side_Index;
+  F32 Fraction_Near, Fraction_Far;
+
+  if (Distance_Start < Distance_End) {
+    F32 Inverse   = 1.f / (Distance_Start - Distance_End);
+    Side_Index    = 1;
+    Fraction_Far  = (Distance_Start + Offset + SURFACE_CLIP_EPSILON) * Inverse;
+    Fraction_Near = (Distance_Start - Offset + SURFACE_CLIP_EPSILON) * Inverse;
+  } else if (Distance_Start > Distance_End) {
+    F32 Inverse   = 1.f / (Distance_Start - Distance_End);
+    Side_Index    = 0;
+    Fraction_Far  = (Distance_Start - Offset - SURFACE_CLIP_EPSILON) * Inverse;
+    Fraction_Near = (Distance_Start + Offset + SURFACE_CLIP_EPSILON) * Inverse;
+  } else {
+    Side_Index    = 0;
+    Fraction_Near = 1.f;
+    Fraction_Far  = 0.f;
+  }
+
+  // Clamp fractions to [0, 1]
+  if (Fraction_Near < 0) Fraction_Near = 0;
+  if (Fraction_Near > 1) Fraction_Near = 1;
+  if (Fraction_Far  < 0) Fraction_Far  = 0;
+  if (Fraction_Far  > 1) Fraction_Far  = 1;
+
+  // Recurse into the near child first (the side the start point is on)
+  {
+    F32 Mid_Fraction = Start_Fraction + (End_Fraction - Start_Fraction) * Fraction_Near;
+    V3 Mid_Point     = V3_Add (Point_Start, V3_Scale (V3_Subtract (Point_End, Point_Start), Fraction_Near));
+    Trace_Through_Tree (Work, Node->Children[Side_Index], Start_Fraction, Mid_Fraction, Point_Start, Mid_Point, Collision);
+  }
+
+  // Then recurse into the far child
+  {
+    F32 Mid_Fraction = Start_Fraction + (End_Fraction - Start_Fraction) * Fraction_Far;
+    V3 Mid_Point     = V3_Add (Point_Start, V3_Scale (V3_Subtract (Point_End, Point_Start), Fraction_Far));
+    Trace_Through_Tree (Work, Node->Children[Side_Index ^ 1], Mid_Fraction, End_Fraction, Mid_Point, Point_End, Collision);
+  }
 }
 
+/* Ray-sphere intersection test for capsule collision endpoints. */
 
+void Trace_Against_Sphere (Trace_Work *Work, V3 Center, F32 Radius, V3 Start, V3 End) {
+  V3  Direction = V3_Subtract (End, Start);
+  F32 Length    = sqrtf (V3_Dot (Direction, Direction));
 
-/* <<physics>> =========================================================== */
+  // Degenerate case: zero-length trace, just test containment
+  if (Length < 1e-6f) {
+    V3 Delta = V3_Subtract (Start, Center);
+    if (V3_Dot (Delta, Delta) <= Radius * Radius) {
+      Work->Result.Start_Solid = 1;
+      Work->Result.All_Solid   = 1;
+      Work->Result.Fraction    = 0;
+    }
+    return;
+  }
 
-#define PM_GRAVITY       800.f
-#define PM_FRICTION      6.f
-#define PM_STOPSPEED     100.f
-#define PM_ACCELERATE    10.f
-#define PM_AIRACCELERATE 1.f
-#define PM_MAXSPEED      320.f
-#define JUMP_VELOCITY    270.f
-#define STEPSIZE         18.f
-#define MIN_WALK_NORMAL  0.7f
-#define OVERCLIP         1.001f
-#define MAX_CLIP_PLANES  5
-#define DEFAULT_VIEWHEIGHT 26.f
-#define CROUCH_VIEWHEIGHT  12.f
+  // Solve the quadratic equation for ray-sphere intersection
+  Direction        = V3_Scale (Direction, 1.f / Length);
+  V3  Offset       = V3_Subtract (Start, Center);
+  F32 Quadratic_B  = 2.f * V3_Dot (Direction, Offset);
+  F32 Quadratic_C  = V3_Dot (Offset, Offset) - Radius * Radius;
+  F32 Discriminant = Quadratic_B * Quadratic_B - 4.f * Quadratic_C;
+  if (Discriminant <= 0) return;
 
-static const V3 PM_MINS = {-15, -24, -15};
+  // Check the nearest intersection
+  F32 Square_Root  = sqrtf (Discriminant);
+  F32 Intersection = (-Quadratic_B - Square_Root) * 0.5f;
+  if (Intersection < 0) {
+    Work->Result.Start_Solid = 1;
+    Intersection = (-Quadratic_B + Square_Root) * 0.5f;
+    if (Intersection < 0) {
+      Work->Result.All_Solid = 1;
+      Work->Result.Fraction  = 0;
+      return;
+    }
+    return;
+  }
 
+  // Normalize the intersection parameter to [0,1] and record if closer than previous hits
+  Intersection /= Length;
+  if (Intersection < Work->Result.Fraction) {
+    Work->Result.Fraction = Intersection < 0 ? 0 : Intersection;
+    V3 Hit = V3_Add (Start, V3_Scale (V3_Subtract (End, Start), Intersection));
+    Work->Result.Normal = V3_Normalize (V3_Subtract (Hit, Center));
+  }
+}
+
+/* Ray-cylinder intersection for the middle section of a capsule (vertical axis only). */
+
+void Trace_Against_Vertical_Cylinder (Trace_Work *Work, V3 Center, F32 Radius, F32 Half_Height, V3 Start, V3 End) {
+
+  // Project the trace onto the XZ plane for 2D circle intersection
+  F32 Delta_X  = End.x - Start.x;
+  F32 Delta_Z  = End.z - Start.z;
+  F32 Offset_X = Start.x - Center.x;
+  F32 Offset_Z = Start.z - Center.z;
+  F32 Quadratic_A = Delta_X * Delta_X + Delta_Z * Delta_Z;
+  if (Quadratic_A < 1e-12f) return;
+
+  F32 Quadratic_B = 2.f * (Offset_X * Delta_X + Offset_Z * Delta_Z);
+  F32 Quadratic_C = Offset_X * Offset_X + Offset_Z * Offset_Z - Radius * Radius;
+  F32 Discriminant = Quadratic_B * Quadratic_B - 4.f * Quadratic_A * Quadratic_C;
+  if (Discriminant <= 0) return;
+
+  // Compute the nearest intersection parameter
+  F32 Square_Root = sqrtf (Discriminant);
+  F32 Parameter   = (-Quadratic_B - Square_Root) / (2.f * Quadratic_A);
+  if (Parameter < 0 or Parameter >= Work->Result.Fraction) return;
+
+  // Check that the intersection is within the cylinder's vertical extent
+  F32 Intersection_Y = Start.y + Parameter * (End.y - Start.y);
+  if (Intersection_Y < Center.y - Half_Height or Intersection_Y > Center.y + Half_Height) return;
+
+  // Record the hit with a horizontal normal (no vertical component)
+  Work->Result.Fraction = Parameter;
+  F32 Hit_X  = Start.x + Parameter * Delta_X - Center.x;
+  F32 Hit_Z  = Start.z + Parameter * Delta_Z - Center.z;
+  F32 Hit_Length = sqrtf (Hit_X * Hit_X + Hit_Z * Hit_Z);
+  if (Hit_Length > 1e-6f)
+    Work->Result.Normal = V3_Make (Hit_X / Hit_Length, 0, Hit_Z / Hit_Length);
+}
+
+/* Capsule-vs-capsule swept intersection test: tests the cylinder body and both
+   hemispherical end-caps of the combined Minkowski sum capsule. */
+
+void 
+Trace_Capsule_Against_Capsule (Trace_Work *Work,
+                               V3          Center,
+                               F32         Radius,
+                               F32         Half_Height,
+                               F32         Sphere_Offset,
+                               V3          Start,
+                               V3          End)
+{
+  F32 Combined_Radius  = Radius + Work->Sphere.Radius;
+  F32 Cylinder_Height  = Half_Height + Work->Sphere.Half_Height - Combined_Radius;
+
+  // Test against the cylindrical body of the combined capsule
+  if (Cylinder_Height > 0)
+    Trace_Against_Vertical_Cylinder (Work, Center, Combined_Radius, Cylinder_Height, Start, End);
+
+  // Test against the top hemisphere
+  V3 Top = V3_Add (Center, V3_Make (0, Sphere_Offset, 0));
+  Trace_Against_Sphere (/*Work        =>*/ Work,
+                        /*Center      =>*/ Top,
+                        /*Radius      =>*/ Combined_Radius,
+                        /*Start       =>*/ V3_Subtract (Start, Work->Sphere.Offset),
+                        /*End         =>*/ V3_Subtract (End, Work->Sphere.Offset));
+
+  // Test against the bottom hemisphere
+  V3 Bottom = V3_Subtract (Center, V3_Make (0, Sphere_Offset, 0));
+  Trace_Against_Sphere (/*Work        =>*/ Work,
+                        /*Center      =>*/ Bottom,
+                        /*Radius      =>*/ Combined_Radius,
+                        /*Start       =>*/ V3_Add (Start, Work->Sphere.Offset),
+                        /*End         =>*/ V3_Add (End, Work->Sphere.Offset));
+}
+
+/* Perform a complete collision trace from Start to End with the given AABB extents.
+   Traverses the BSP tree, tests against all relevant solid brushes, and returns the
+   closest hit fraction, position, and surface normal. */
+
+Trace_Result Collision_Trace (V3 Start, V3 End, V3 Minimums, V3 Maximums,
+                                     Collision_Map *Collision, int Use_Capsule) {
+  Trace_Work Work;
+  memset (&Work, 0, sizeof (Work));
+  Work.Start           = Start;
+  Work.End             = End;
+  Work.Result.Fraction = 1.f;
+
+  // Compute the half-extents from the asymmetric bounding box
+  Work.Extents = V3_Make (/*x =>*/ (-Minimums.x > Maximums.x) ? -Minimums.x : Maximums.x,
+                          /*y =>*/ (-Minimums.y > Maximums.y) ? -Minimums.y : Maximums.y,
+                          /*z =>*/ (-Minimums.z > Maximums.z) ? -Minimums.z : Maximums.z);
+
+  // Determine whether this is a point trace (zero-size bounding box)
+  Work.Is_Point = (Minimums.x == 0 and Minimums.y == 0 and Minimums.z == 0
+               and Maximums.x == 0 and Maximums.y == 0 and Maximums.z == 0);
+
+  // Configure capsule parameters if capsule mode is requested and the trace is not a point
+  Work.Sphere.Use_Capsule = Use_Capsule and not Work.Is_Point;
+  if (Work.Sphere.Use_Capsule) {
+    F32 Half_Width          = Maximums.x;
+    F32 Half_Height         = Maximums.y;
+    Work.Sphere.Radius      = Half_Width < Half_Height ? Half_Width : Half_Height;
+    Work.Sphere.Half_Height = Half_Height;
+    Work.Sphere.Offset      = V3_Make (0, Half_Height - Work.Sphere.Radius, 0);
+  }
+
+  // Pre-compute the eight corners of the bounding box for sign-bit-indexed plane testing
+  for (int Index = 0; Index < 8; Index++) {
+    Work.Offsets[Index] = V3_Make (/*x =>*/ (Index & 1) ? Maximums.x : Minimums.x,
+                                   /*y =>*/ (Index & 2) ? Maximums.y : Minimums.y,
+                                   /*z =>*/ (Index & 4) ? Maximums.z : Minimums.z);
+  }
+
+  // Increment the check counter to invalidate previous brush-test marks
+  Collision->Check_Counter++;
+  Trace_Through_Tree (&Work, 0, 0.f, 1.f, Work.Start, Work.End, Collision);
+
+  // Compute the final end position from the hit fraction
+  if (Work.Result.Fraction == 1.f) {
+    Work.Result.End_Position = End;
+  } else {
+    Work.Result.End_Position = V3_Add (Start, V3_Scale (V3_Subtract (End, Start), Work.Result.Fraction));
+  }
+
+  return Work.Result;
+}
+
+/* <<physics>> ========================================================================================== */
+
+#define GRAVITY             800.f
+#define GROUND_FRICTION     6.f
+#define STOP_SPEED          100.f
+#define GROUND_ACCELERATE   10.f
+#define AIR_ACCELERATE      1.f
+#define MAXIMUM_SPEED       320.f
+#define JUMP_VELOCITY       270.f
+#define STEP_SIZE           18.f
+#define MINIMUM_WALK_NORMAL 0.7f
+#define OVERBOUNCE          1.001f
+#define MAXIMUM_CLIP_PLANES 5
+#define DEFAULT_VIEW_HEIGHT 26.f
+#define CROUCH_VIEW_HEIGHT  12.f
+
+const V3 PLAYER_MINIMUMS = {-15, -24, -15 };
+
+// Player movement state: position, velocity, orientation, and ground contact information
 typedef struct {
-    V3  pos;
-    V3  vel;
-    F32 yaw, pitch;
-    int on_ground;     /* walking: on walkable ground */
-    int jump_held;
-    V3  ground_normal;
-    int ground_plane;  /* have a ground plane (may be too steep) */
-    int ducked;        /* crouching */
-    F32 viewheight;    /* current eye height above pos */
+  V3  Position;        // World-space position of the player's bounding box origin
+  V3  Velocity;        // Current velocity in units per second
+  F32 Yaw, Pitch;      // Look direction: yaw (horizontal) and pitch (vertical) in radians
+  int On_Ground;        // Non-zero if the player is standing on a walkable surface
+  int Jump_Held;        // Non-zero if the jump key was held last frame (prevents auto-bunny-hopping)
+  V3  Ground_Normal;    // Surface normal of the ground plane the player is standing on
+  int Ground_Plane;     // Non-zero if the ground trace hit a valid plane (not an edge or brush start)
+  int Ducked;           // Non-zero if the player is crouching
+  F32 View_Height;      // Camera height offset from Position.y (smoothly interpolated)
 } Player;
 
-static V3 pm_maxs(const Player *p) { return v3(15, p->ducked ? 16 : 32, 15); }
-
-static Trace pm_trace(V3 start, V3 end, const Player *p, ColMap *cm) {
-    return cm_trace(start, end, PM_MINS, pm_maxs(p), cm, 1);
+V3 Player_Maximums (const Player *State) {
+  return V3_Make (15, State->Ducked ? 16 : 32, 15);
 }
 
-static V3 pm_clip_velocity(V3 in, V3 normal, F32 overbounce) {
-    F32 backoff = v3dot(in, normal);
-    if (backoff < 0) backoff *= overbounce;
-    else backoff /= overbounce;
-    return v3sub(in, v3scale(normal, backoff));
+Trace_Result Player_Trace (V3 Start, V3 End, const Player *State, Collision_Map *Collision) {
+  return Collision_Trace (Start, End, PLAYER_MINIMUMS, Player_Maximums (State), Collision, 1);
 }
 
-/* Q3 PM_CorrectAllSolid: jitter ±1 in each axis to escape solid */
-static int pm_correct_allsolid(Player *p, ColMap *cm) {
-    for (int i = -1; i <= 1; i++)
-    for (int j = -1; j <= 1; j++)
-    for (int k = -1; k <= 1; k++) {
-        V3 pt = v3(p->pos.x + (F32)i, p->pos.y + (F32)j, p->pos.z + (F32)k);
-        Trace tr = pm_trace(pt, pt, p, cm);
-        if (!tr.allsolid) {
-            /* found non-solid spot; redo ground trace from original pos */
-            V3 down = v3add(p->pos, v3(0, -0.25f, 0));
-            tr = pm_trace(p->pos, down, p, cm);
-            p->ground_normal = tr.normal;
-            p->ground_plane = (tr.fraction < 1.f);
-            p->on_ground = (tr.fraction < 1.f && tr.normal.y >= MIN_WALK_NORMAL);
+/* Remove the component of velocity along a surface normal, with a slight overbounce
+   factor to prevent the player from sinking into surfaces. */
+
+V3 Clip_Velocity (V3 Velocity, V3 Normal, F32 Overbounce_Factor) {
+  F32 Backoff = V3_Dot (Velocity, Normal);
+  if (Backoff < 0) Backoff *= Overbounce_Factor;
+  else             Backoff /= Overbounce_Factor;
+  return V3_Subtract (Velocity, V3_Scale (Normal, Backoff));
+}
+
+/* Attempt to nudge the player out of solid geometry by testing small offsets in all
+   directions.  Returns true if a non-solid position was found. */
+
+int Player_Correct_All_Solid (Player *State, Collision_Map *Collision) {
+  for (int Offset_X = -1; Offset_X <= 1; Offset_X++)
+  for (int Offset_Y = -1; Offset_Y <= 1; Offset_Y++)
+  for (int Offset_Z = -1; Offset_Z <= 1; Offset_Z++) {
+    V3 Adjusted = V3_Make (State->Position.x + (F32)Offset_X, State->Position.y + (F32)Offset_Y, State->Position.z + (F32)Offset_Z);
+    Trace_Result Trace = Player_Trace (Adjusted, Adjusted, State, Collision);
+
+      // Found a valid non-solid position; probe downward for ground contact
+    if (not Trace.All_Solid) {
+
+      // Found a valid position; update ground state from a short downward probe
+      V3 Down = V3_Add (State->Position, V3_Make (0, -0.25f, 0));
+      Trace = Player_Trace (State->Position, Down, State, Collision);
+      State->Ground_Normal = Trace.Normal;
+      State->Ground_Plane  = (Trace.Fraction < 1.f);
+      State->On_Ground     = (Trace.Fraction < 1.f and Trace.Normal.y >= MINIMUM_WALK_NORMAL);
+      return 1;
+    }
+  }
+  State->On_Ground    = 0;
+  State->Ground_Plane = 0;
+  return 0;
+}
+
+/* Cast a short ray downward to determine whether the player is standing on solid ground.
+   Updates the ground plane normal and the on-ground flag based on the surface slope. */
+
+void Player_Ground_Trace (Player *State, Collision_Map *Collision) {
+  V3 Down = V3_Add (State->Position, V3_Make (0, -0.25f, 0));
+  Trace_Result Trace = Player_Trace (State->Position, Down, State, Collision);
+
+  // If the trace starts inside solid, attempt to correct the position
+  if (Trace.All_Solid) {
+    if (not Player_Correct_All_Solid (State, Collision)) return;
+    return;
+  }
+
+  // No ground contact if the trace reaches full distance
+  if (Trace.Fraction == 1.f) {
+    State->Ground_Plane = 0;
+    State->On_Ground    = 0;
+    return;
+  }
+
+  // Moving upward and away from the surface: not grounded
+  if (State->Velocity.y > 0 and V3_Dot (State->Velocity, Trace.Normal) > 10.f) {
+    State->Ground_Plane = 0;
+    State->On_Ground    = 0;
+    return;
+  }
+
+  // Surface is too steep to walk on: touching a wall or steep slope
+  if (Trace.Normal.y < MINIMUM_WALK_NORMAL) {
+    State->Ground_Plane  = 1;
+    State->Ground_Normal = Trace.Normal;
+    State->On_Ground     = 0;
+    return;
+  }
+
+  // Solidly on walkable ground
+  State->Ground_Plane  = 1;
+  State->Ground_Normal = Trace.Normal;
+  State->On_Ground     = 1;
+}
+
+/* Apply ground friction to the player's velocity.  The friction model uses a control
+   speed (clamped to STOP_SPEED) to ensure low-speed movement decays quickly. */
+
+void Player_Apply_Friction (Player *State, F32 Delta_Time) {
+  V3 Horizontal_Velocity = State->Velocity;
+  if (State->On_Ground) Horizontal_Velocity.y = 0;
+  F32 Speed = sqrtf (V3_Dot (Horizontal_Velocity, Horizontal_Velocity));
+
+  // Kill velocity entirely below the minimum threshold
+  if (Speed < 1.f) {
+    State->Velocity.x = 0;
+    State->Velocity.z = 0;
+    return;
+  }
+  F32 Drop = 0;
+  if (State->On_Ground) {
+    F32 Control = Speed < STOP_SPEED ? STOP_SPEED : Speed;
+    Drop += Control * GROUND_FRICTION * Delta_Time;
+  }
+
+  // Scale velocity by the remaining fraction after friction
+  F32 New_Speed = Speed - Drop;
+  if (New_Speed < 0) New_Speed = 0;
+  New_Speed /= Speed;
+  State->Velocity.x *= New_Speed;
+  State->Velocity.y *= New_Speed;
+  State->Velocity.z *= New_Speed;
+}
+
+/* Accelerate the player along a wish direction up to a maximum wish speed.
+   The acceleration is capped so that the player cannot exceed the desired speed. */
+
+void Player_Accelerate (Player *State, V3 Wish_Direction, F32 Wish_Speed, F32 Acceleration, F32 Delta_Time) {
+  F32 Current_Speed = V3_Dot (State->Velocity, Wish_Direction);
+  F32 Add_Speed     = Wish_Speed - Current_Speed;
+
+  // Comment here !!!
+  if (Add_Speed <= 0) return;
+
+  // Comment here !!!
+  F32 Acceleration_Speed = Acceleration * Delta_Time * Wish_Speed;
+  if (Acceleration_Speed > Add_Speed) Acceleration_Speed = Add_Speed;
+
+  // Comment here !!!
+  State->Velocity = V3_Add (State->Velocity, V3_Scale (Wish_Direction, Acceleration_Speed));
+}
+
+/* Iterative clipping slide-move: advance the player along their velocity, clipping against
+   surfaces encountered.  Handles up to MAXIMUM_CLIP_PLANES simultaneous contacts by computing
+   a velocity that satisfies all contact constraints (crease resolution). */
+
+int Player_Slide_Move (Player *State, Collision_Map *Collision, F32 Delta_Time, int Apply_Gravity) {
+  int Plane_Count  = 0;
+  F32 Time_Left    = Delta_Time;
+  V3  End_Velocity = State->Velocity;
+  V3  Planes[MAXIMUM_CLIP_PLANES];
+
+  // Apply gravity: average the start and end vertical velocity for a trapezoidal integration
+  if (Apply_Gravity) {
+    End_Velocity.y -= GRAVITY * Delta_Time;
+    State->Velocity.y = (State->Velocity.y + End_Velocity.y) * 0.5f;
+    if (State->Ground_Plane)
+      State->Velocity = Clip_Velocity (State->Velocity, State->Ground_Normal, OVERBOUNCE);
+  }
+
+
+  // Seed the plane list with the ground normal and the velocity direction
+  if (State->Ground_Plane)
+    Planes[Plane_Count++] = State->Ground_Normal;
+
+  // Comment here !!!
+  {
+    F32 Magnitude = sqrtf (V3_Dot (State->Velocity, State->Velocity));
+    Planes[Plane_Count++] = Magnitude > 0.001f ? V3_Scale (State->Velocity, 1.f / Magnitude) : V3_Make (0, 1, 0);
+  }
+
+  // Iteratively advance the player, clipping against each surface encountered
+  for (int Bump = 0; Bump < 4; Bump++) {
+    V3 End_Position = V3_Add (State->Position, V3_Scale (State->Velocity, Time_Left));
+    Trace_Result Trace = Player_Trace (State->Position, End_Position, State, Collision);
+
+    // If stuck in solid, zero vertical velocity and bail
+    if (Trace.All_Solid) {State->Velocity.y = 0; return 1; }
+
+    // Advance the position by the fraction of movement that was unobstructed
+    if (Trace.Fraction > 0) State->Position = Trace.End_Position;
+    if (Trace.Fraction == 1.f) break;
+
+    // Reduce the remaining time by the consumed fraction
+    Time_Left -= Time_Left * Trace.Fraction;
+
+    // Too many clip planes encountered; stop all movement
+    if (Plane_Count >= MAXIMUM_CLIP_PLANES) {State->Velocity = V3_Make (0, 0, 0); return 1; }
+
+    // Check if this normal is nearly parallel to an existing clip plane
+    int Same_Plane = 0;
+    for (int Index = 0; Index < Plane_Count; Index++) {
+      if (V3_Dot (Trace.Normal, Planes[Index]) > 0.85f) {
+        State->Velocity = V3_Add (Trace.Normal, State->Velocity);
+        Same_Plane = 1;
+        break;
+      }
+    }
+    if (Same_Plane) continue;
+
+    // Add this new contact plane and resolve velocity against all accumulated planes
+    Planes[Plane_Count++] = Trace.Normal;
+
+    // Find the first clip plane that the current velocity still enters
+    int Plane_Index;
+    for (Plane_Index = 0; Plane_Index < Plane_Count; Plane_Index++) {
+      if (V3_Dot (State->Velocity, Planes[Plane_Index]) >= 0.1f) continue;
+
+      // Clip the velocity against the blocking plane
+      V3 Clipped     = Clip_Velocity (State->Velocity, Planes[Plane_Index], OVERBOUNCE);
+      V3 End_Clipped = Clip_Velocity (End_Velocity,     Planes[Plane_Index], OVERBOUNCE);
+
+      // Check if the clipped velocity violates any other accumulated plane
+      int Other_Index;
+      for (Other_Index = 0; Other_Index < Plane_Count; Other_Index++) {
+
+        // Comment here !!!
+        if (Other_Index == Plane_Index) continue;
+
+        // Comment here !!!
+        if (V3_Dot (Clipped, Planes[Other_Index]) >= 0.1f) continue;
+
+        // Clip against the second plane
+        Clipped     = Clip_Velocity (Clipped,     Planes[Other_Index], OVERBOUNCE);
+        End_Clipped = Clip_Velocity (End_Clipped, Planes[Other_Index], OVERBOUNCE);
+
+        // If the clipped velocity no longer enters any other plane, accept it
+        if (V3_Dot (Clipped, Planes[Plane_Index]) >= 0) continue;
+
+        // Two planes form a crease: project velocity along the crease direction
+        V3  Crease = V3_Cross (Planes[Plane_Index], Planes[Other_Index]);
+        F32 Crease_Length_Squared = V3_Dot (Crease, Crease);
+
+        // Two planes form a crease; project velocity along the crease direction
+        if (Crease_Length_Squared < 0.001f) {
+          Clipped     = V3_Add (State->Velocity, Trace.Normal);
+          End_Clipped = V3_Add (End_Velocity,     Trace.Normal);
+
+        // Comment here !!!
+        } else {
+          V3 Direction   = V3_Scale (Crease, 1.f / sqrtf (Crease_Length_Squared));
+          F32 Dot_Product = V3_Dot (Direction, State->Velocity);
+          Clipped         = V3_Scale (Direction, Dot_Product);
+          Dot_Product     = V3_Dot (Direction, End_Velocity);
+          End_Clipped     = V3_Scale (Direction, Dot_Product);
+
+          // If a third plane also blocks the crease direction, zero velocity
+          int Third;
+          for (Third = 0; Third < Plane_Count; Third++) {
+            if (Third == Plane_Index or Third == Other_Index) continue;
+            if (V3_Dot (Clipped, Planes[Third]) >= 0.1f) continue;
+            State->Velocity = V3_Make (0, 0, 0);
             return 1;
+          }
         }
+      }
+
+      // Apply the clipped velocity to the player position
+      State->Velocity = Clipped;
+      End_Velocity    = End_Clipped;
+      break;
     }
-    p->on_ground = 0;
-    p->ground_plane = 0;
-    return 0;
+  }
+
+  // Restore the gravity-adjusted end velocity
+  if (Apply_Gravity) State->Velocity = End_Velocity;
+  return 1;
 }
 
-/* Q3 PM_GroundTrace: trace 0.25 units down to detect ground */
-static void pm_ground_trace(Player *p, ColMap *cm) {
-    V3 point = v3add(p->pos, v3(0, -0.25f, 0));
-    Trace tr = pm_trace(p->pos, point, p, cm);
+/* Step-slide move: first attempt a normal slide move.  If the player hit a wall or step,
+   try stepping up by STEP_SIZE, sliding along the raised plane, then stepping back down.
+   This allows the player to smoothly walk up stairs. */
 
-    if (tr.allsolid) {
-        if (!pm_correct_allsolid(p, cm)) return;
-        return; /* pm_correct_allsolid set ground state */
-    }
+void Player_Step_Slide_Move (Player *State, Collision_Map *Collision, F32 Delta_Time, int Apply_Gravity) {
+  V3 Start_Position = State->Position;
+  V3 Start_Velocity = State->Velocity;
 
-    if (tr.fraction == 1.f) {
-        /* free fall — no ground */
-        p->ground_plane = 0;
-        p->on_ground = 0;
-        return;
-    }
+  // Attempt a normal slide move first
+  if (not Player_Slide_Move (State, Collision, Delta_Time, Apply_Gravity)) return;
 
-    /* check if getting thrown off ground */
-    if (p->vel.y > 0 && v3dot(p->vel, tr.normal) > 10.f) {
-        p->ground_plane = 0;
-        p->on_ground = 0;
-        return;
-    }
+  // Check if there is ground below the starting position (needed for step detection)
+  V3 Down = V3_Add (Start_Position, V3_Make (0, -STEP_SIZE, 0));
+  Trace_Result Trace = Player_Trace (Start_Position, Down, State, Collision);
 
-    /* steep slope: have ground plane but can't walk on it */
-    if (tr.normal.y < MIN_WALK_NORMAL) {
-        p->ground_plane = 1;
-        p->ground_normal = tr.normal;
-        p->on_ground = 0;
-        return;
-    }
+  // Do not step if the player is moving upward and either in the air or on a steep slope
+  if (State->Velocity.y > 0 and (Trace.Fraction == 1.f or Trace.Normal.y < MINIMUM_WALK_NORMAL)) return;
 
-    /* valid walkable ground */
-    p->ground_plane = 1;
-    p->ground_normal = tr.normal;
-    p->on_ground = 1;
+  // Try stepping up: trace upward by STEP_SIZE from the starting position
+  V3 Up = V3_Add (Start_Position, V3_Make (0, STEP_SIZE, 0));
+  Trace = Player_Trace (Start_Position, Up, State, Collision);
+  if (Trace.All_Solid) return;
+
+  // Slide move from the elevated position
+  F32 Actual_Step = Trace.End_Position.y - Start_Position.y;
+  State->Position = Trace.End_Position;
+  State->Velocity = Start_Velocity;
+  Player_Slide_Move (State, Collision, Delta_Time, Apply_Gravity);
+
+  // Step back down to the ground after sliding
+  V3 Step_Down = V3_Add (State->Position, V3_Make (0, -Actual_Step, 0));
+  Trace = Player_Trace (State->Position, Step_Down, State, Collision);
+  if (not Trace.All_Solid) State->Position = Trace.End_Position;
+
+  // Clip velocity against the surface we landed on
+  if (Trace.Fraction < 1.f)
+    State->Velocity = Clip_Velocity (State->Velocity, Trace.Normal, OVERBOUNCE);
 }
 
-/* Q3 PM_Friction: ground friction when walking, zero in air */
-static void pm_friction(Player *p, F32 dt) {
-    V3 vec = p->vel;
-    if (p->on_ground) vec.y = 0; /* ignore vertical for speed calc when walking */
-    F32 speed = sqrtf(v3dot(vec, vec));
-    if (speed < 1.f) {
-        p->vel.x = 0;
-        p->vel.z = 0;
-        /* keep vel.y — allow sinking/falling */
-        return;
-    }
+/* Ground movement: apply friction, compute the wish direction from input relative to the
+   ground plane, accelerate, then perform a step-slide move. */
 
-    F32 drop = 0;
-    if (p->on_ground) {
-        F32 control = speed < PM_STOPSPEED ? PM_STOPSPEED : speed;
-        drop += control * PM_FRICTION * dt;
-    }
-    /* no air friction in Q3 (drop stays 0 in air) */
+void Player_Walk_Move (Player *State, Collision_Map *Collision, Input Input_Data, F32 Delta_Time) {
+  Player_Apply_Friction (State, Delta_Time);
 
-    F32 newspeed = speed - drop;
-    if (newspeed < 0) newspeed = 0;
-    newspeed /= speed;
+  // Compute the forward and right vectors projected onto the ground plane
+  F32 Cosine_Yaw = cosf (State->Yaw);
+  F32 Sine_Yaw   = sinf (State->Yaw);
+  V3 Forward = V3_Normalize (Clip_Velocity (V3_Make (Sine_Yaw, 0, -Cosine_Yaw), State->Ground_Normal, OVERBOUNCE));
+  V3 Right   = V3_Normalize (Clip_Velocity (V3_Make (Cosine_Yaw, 0, Sine_Yaw),  State->Ground_Normal, OVERBOUNCE));
 
-    p->vel.x *= newspeed;
-    p->vel.y *= newspeed;
-    p->vel.z *= newspeed;
+  // Sum the input directions into a wish velocity
+  V3 Wish_Velocity = V3_Make (0, 0, 0);
+  if (Input_Data.Forward) Wish_Velocity = V3_Add      (Wish_Velocity, Forward);
+  if (Input_Data.Back)    Wish_Velocity = V3_Subtract  (Wish_Velocity, Forward);
+  if (Input_Data.Right)   Wish_Velocity = V3_Add      (Wish_Velocity, Right);
+  if (Input_Data.Left)    Wish_Velocity = V3_Subtract  (Wish_Velocity, Right);
+
+  // Comment here !!!
+  F32 Wish_Speed = sqrtf (V3_Dot (Wish_Velocity, Wish_Velocity));
+  if (Wish_Speed > 0.001f) {
+    Wish_Velocity = V3_Scale (Wish_Velocity, 1.f / Wish_Speed);
+    Wish_Speed = MAXIMUM_SPEED;
+  }
+  if (State->Ducked) Wish_Speed *= 0.25f;
+
+  // Comment here !!!
+  Player_Accelerate (State, Wish_Velocity, Wish_Speed, GROUND_ACCELERATE, Delta_Time);
+
+  // Preserve speed magnitude through the ground-plane clip to avoid speed loss on slopes
+  F32 Speed_Magnitude = sqrtf (V3_Dot (State->Velocity, State->Velocity));
+  State->Velocity = Clip_Velocity (State->Velocity, State->Ground_Normal, OVERBOUNCE);
+  {
+    F32 New_Speed = sqrtf (V3_Dot (State->Velocity, State->Velocity));
+    if (New_Speed > 0.001f)
+      State->Velocity = V3_Scale (State->Velocity, Speed_Magnitude / New_Speed);
+  }
+
+  // Only move if there is horizontal velocity
+  if (State->Velocity.x == 0 and State->Velocity.z == 0) return;
+
+  // Comment here !!!
+  Player_Step_Slide_Move (State, Collision, Delta_Time, 0);
 }
 
-/* Q3 PM_Accelerate: q2-style acceleration (enables strafe-jumping) */
-static void pm_accelerate(Player *p, V3 wishdir, F32 wishspeed,
-                           F32 accel, F32 dt) {
-    F32 currentspeed = v3dot(p->vel, wishdir);
-    F32 addspeed = wishspeed - currentspeed;
-    if (addspeed <= 0) return;
-    F32 accelspeed = accel * dt * wishspeed;
-    if (accelspeed > addspeed) accelspeed = addspeed;
-    p->vel = v3add(p->vel, v3scale(wishdir, accelspeed));
+/* Air movement: apply friction, accelerate along the wish direction (with reduced air
+   acceleration), then perform a step-slide move with gravity applied. */
+
+void Player_Air_Move (Player *State, Collision_Map *Collision, Input Input_Data, F32 Delta_Time) {
+  Player_Apply_Friction (State, Delta_Time);
+
+  // Compute horizontal-only wish direction from input
+  F32 Cosine_Yaw = cosf (State->Yaw);
+  F32 Sine_Yaw   = sinf (State->Yaw);
+  V3 Forward = V3_Make (Sine_Yaw, 0, -Cosine_Yaw);
+  V3 Right   = V3_Make (Cosine_Yaw, 0, Sine_Yaw);
+
+  V3 Wish_Direction = V3_Make (0, 0, 0);
+  if (Input_Data.Forward) Wish_Direction = V3_Add      (Wish_Direction, Forward);
+  if (Input_Data.Back)    Wish_Direction = V3_Subtract  (Wish_Direction, Forward);
+  if (Input_Data.Right)   Wish_Direction = V3_Add      (Wish_Direction, Right);
+  if (Input_Data.Left)    Wish_Direction = V3_Subtract  (Wish_Direction, Right);
+  Wish_Direction.y = 0;
+
+  F32 Wish_Speed = sqrtf (V3_Dot (Wish_Direction, Wish_Direction));
+  if (Wish_Speed > 0.001f) {
+    Wish_Direction = V3_Scale (Wish_Direction, 1.f / Wish_Speed);
+    Wish_Speed = MAXIMUM_SPEED;
+  }
+  if (State->Ducked) Wish_Speed *= 0.25f;
+
+  Player_Accelerate (State, Wish_Direction, Wish_Speed, AIR_ACCELERATE, Delta_Time);
+
+  // Clip velocity against the ground plane if touching a slope
+  if (State->Ground_Plane)
+    State->Velocity = Clip_Velocity (State->Velocity, State->Ground_Normal, OVERBOUNCE);
+
+  Player_Step_Slide_Move (State, Collision, Delta_Time, 1);
 }
 
-/* Q3 PM_SlideMove: collision response with up to 4 bumps */
-static int pm_slide_move(Player *p, ColMap *cm, F32 dt, int gravity) {
-    V3 endVelocity = p->vel;
+/* Handle crouch state transitions: duck down when the crouch key is pressed, and attempt
+   to stand up when released (blocked if there is solid overhead). */
 
-    if (gravity) {
-        endVelocity.y -= PM_GRAVITY * dt;
-        p->vel.y = (p->vel.y + endVelocity.y) * 0.5f;
-        if (p->ground_plane)
-            p->vel = pm_clip_velocity(p->vel, p->ground_normal, OVERCLIP);
+void Player_Check_Crouch (Player *State, Collision_Map *Collision, Input Input_Data) {
+  const F32 Height_Delta = 16.f;
+
+  if (Input_Data.Crouch) {
+
+    // Transition to crouched state by lowering the player's position
+    if (not State->Ducked) {
+      State->Ducked = 1;
+      State->Position.y -= Height_Delta;
     }
 
-    F32 time_left = dt;
-    V3 planes[MAX_CLIP_PLANES];
-    int numplanes = 0;
-
-    if (p->ground_plane)
-        planes[numplanes++] = p->ground_normal;
-
-    /* never turn against original velocity */
-    { F32 s = sqrtf(v3dot(p->vel, p->vel));
-      planes[numplanes++] = s > 0.001f ? v3scale(p->vel, 1.f/s) : v3(0,1,0); }
-
-    for (int bumpcount = 0; bumpcount < 4; bumpcount++) {
-        V3 end = v3add(p->pos, v3scale(p->vel, time_left));
-        Trace tr = pm_trace(p->pos, end, p, cm);
-
-        if (tr.allsolid) { p->vel.y = 0; return 1; }
-        if (tr.fraction > 0) p->pos = tr.endpos;
-        if (tr.fraction == 1.f) break;
-
-        time_left -= time_left * tr.fraction;
-
-        if (numplanes >= MAX_CLIP_PLANES) { p->vel = v3(0,0,0); return 1; }
-
-        /* Q3: if same plane as before, nudge velocity along it.
-           Relaxed from 0.99 to 0.85: capsule traces can produce varied
-           normals at brush seams (bevel planes are designed for AABB). */
-        int samePlane = 0;
-        for (int i = 0; i < numplanes; i++) {
-            if (v3dot(tr.normal, planes[i]) > 0.85f) {
-                p->vel = v3add(tr.normal, p->vel);
-                samePlane = 1;
-                break;
-            }
-        }
-        if (samePlane) continue;
-
-        planes[numplanes++] = tr.normal;
-
-        /* Q3: clip velocity to parallel all clip planes */
-        int i;
-        for (i = 0; i < numplanes; i++) {
-            if (v3dot(p->vel, planes[i]) >= 0.1f) continue;
-
-            V3 cv = pm_clip_velocity(p->vel, planes[i], OVERCLIP);
-            V3 ecv = pm_clip_velocity(endVelocity, planes[i], OVERCLIP);
-
-            int j;
-            for (j = 0; j < numplanes; j++) {
-                if (j == i) continue;
-                if (v3dot(cv, planes[j]) >= 0.1f) continue;
-
-                cv = pm_clip_velocity(cv, planes[j], OVERCLIP);
-                ecv = pm_clip_velocity(ecv, planes[j], OVERCLIP);
-
-                if (v3dot(cv, planes[i]) >= 0) continue;
-
-                /* slide along crease between planes[i] and planes[j] */
-                V3 dv = v3cross(planes[i], planes[j]);
-                F32 dlen2 = v3dot(dv, dv);
-                if (dlen2 < 0.001f) {
-                    /* nearly parallel planes: degenerate crease.
-                       Nudge velocity out along latest normal. */
-                    cv = v3add(p->vel, tr.normal);
-                    ecv = v3add(endVelocity, tr.normal);
-                } else {
-                    V3 dir = v3scale(dv, 1.f / sqrtf(dlen2));
-                    F32 d = v3dot(dir, p->vel);
-                    cv = v3scale(dir, d);
-                    d = v3dot(dir, endVelocity);
-                    ecv = v3scale(dir, d);
-
-                    /* check for triple plane interaction → stop dead */
-                    int k;
-                    for (k = 0; k < numplanes; k++) {
-                        if (k == i || k == j) continue;
-                        if (v3dot(cv, planes[k]) >= 0.1f) continue;
-                        p->vel = v3(0,0,0); return 1;
-                    }
-                }
-            }
-
-            p->vel = cv;
-            endVelocity = ecv;
-            break;
-        }
+  // Attempt to stand: check if there is room above
+  } else if (State->Ducked) {
+    V3 Test_Position     = V3_Add (State->Position, V3_Make (0, Height_Delta, 0));
+    V3 Standing_Maximums = V3_Make (15, 32, 15);
+    Trace_Result Trace   = Collision_Trace (Test_Position, Test_Position, PLAYER_MINIMUMS, Standing_Maximums, Collision, 1);
+    if (not Trace.All_Solid) {
+      State->Ducked   = 0;
+      State->Position = Test_Position;
     }
+  }
 
-    if (gravity) p->vel = endVelocity;
-
-    return 1; /* Q3 returns bumpcount != 0; conservative */
+  State->View_Height = State->Ducked ? CROUCH_VIEW_HEIGHT : DEFAULT_VIEW_HEIGHT;
 }
 
-/* Q3 PM_StepSlideMove: try slide, then try stepping up */
-static void pm_step_slide_move(Player *p, ColMap *cm, F32 dt, int gravity) {
-    V3 start_o = p->pos;
-    V3 start_v = p->vel;
+/* Top-level player movement entry point.  Updates yaw/pitch from mouse input, handles
+   crouching, determines ground contact, and dispatches to walk or air movement. */
 
-    if (!pm_slide_move(p, cm, dt, gravity)) return;
+void Player_Move (Player *State, Collision_Map *Collision, Input Input_Data, F32 Delta_Time) {
 
-    /* check if we should try stepping up */
-    V3 down = v3add(start_o, v3(0, -STEPSIZE, 0));
-    Trace tr = pm_trace(start_o, down, p, cm);
-    /* never step up when you still have up velocity */
-    if (p->vel.y > 0 && (tr.fraction == 1.f || tr.normal.y < MIN_WALK_NORMAL))
-        return;
+  // Apply mouse look: accumulate yaw and pitch from mouse deltas
+  State->Yaw   += Input_Data.Delta_X * 0.003f;
+  State->Pitch += Input_Data.Delta_Y * 0.003f;
+  if (State->Pitch >  1.4f) State->Pitch =  1.4f;
+  if (State->Pitch < -1.4f) State->Pitch = -1.4f;
 
-    /* try stepping up */
-    V3 up = v3add(start_o, v3(0, STEPSIZE, 0));
-    tr = pm_trace(start_o, up, p, cm);
-    if (tr.allsolid) return;
+  // No-clip fallback movement when no collision data is loaded
+  if (not Collision or not Collision->Node_Count) {
+    F32 Cosine_Yaw = cosf (State->Yaw);
+    F32 Sine_Yaw   = sinf (State->Yaw);
+    V3 Forward  = V3_Make (Sine_Yaw, 0, -Cosine_Yaw);
+    V3 Right    = V3_Make (Cosine_Yaw, 0, Sine_Yaw);
+    V3 Movement = V3_Make (0, 0, 0);
+    F32 Speed   = 320.f;
+    if (Input_Data.Forward) Movement = V3_Add (Movement, V3_Scale (Forward,  Speed));
+    if (Input_Data.Back)    Movement = V3_Add (Movement, V3_Scale (Forward, -Speed));
+    if (Input_Data.Right)   Movement = V3_Add (Movement, V3_Scale (Right,    Speed));
+    if (Input_Data.Left)    Movement = V3_Add (Movement, V3_Scale (Right,   -Speed));
+    if (Input_Data.Jump)    Movement.y += Speed;
+    State->Position = V3_Add (State->Position, V3_Scale (Movement, Delta_Time));
+    return;
+  }
 
-    F32 stepSize = tr.endpos.y - start_o.y;
+  // Update crouch state before checking ground contact
+  Player_Check_Crouch (State, Collision, Input_Data);
+  Player_Ground_Trace (State, Collision);
 
-    /* from raised position, try slidemove */
-    p->pos = tr.endpos;
-    p->vel = start_v;
-    pm_slide_move(p, cm, dt, gravity);
+  // Dispatch to grounded or airborne movement
+  if (State->On_Ground) {
+    if (Input_Data.Jump and not State->Jump_Held) {
 
-    /* push back down */
-    V3 step_down = v3add(p->pos, v3(0, -stepSize, 0));
-    tr = pm_trace(p->pos, step_down, p, cm);
-    if (!tr.allsolid) p->pos = tr.endpos;
-    if (tr.fraction < 1.f)
-        p->vel = pm_clip_velocity(p->vel, tr.normal, OVERCLIP);
-}
-
-/* Q3 PM_WalkMove: on-ground movement */
-static void pm_walk_move(Player *p, ColMap *cm, Input in, F32 dt) {
-    pm_friction(p, dt);
-
-    F32 cy = cosf(p->yaw), sy = sinf(p->yaw);
-    V3 fwd = v3(sy, 0, -cy);
-    V3 right = v3(cy, 0, sy);
-
-    /* Q3: project forward/right onto ground plane, THEN compute wishvel */
-    fwd = v3norm(pm_clip_velocity(fwd, p->ground_normal, OVERCLIP));
-    right = v3norm(pm_clip_velocity(right, p->ground_normal, OVERCLIP));
-
-    V3 wish = v3(0, 0, 0);
-    if (in.fwd)   wish = v3add(wish, fwd);
-    if (in.back)  wish = v3sub(wish, fwd);
-    if (in.right) wish = v3add(wish, right);
-    if (in.left)  wish = v3sub(wish, right);
-
-    F32 wishspeed = sqrtf(v3dot(wish, wish));
-    if (wishspeed > 0.001f) {
-        wish = v3scale(wish, 1.f / wishspeed);
-        wishspeed = PM_MAXSPEED;
-    }
-    if (p->ducked) wishspeed *= 0.25f;
-
-    pm_accelerate(p, wish, wishspeed, PM_ACCELERATE, dt);
-
-    /* preserve speed magnitude through ground clip */
-    F32 vel = sqrtf(v3dot(p->vel, p->vel));
-    p->vel = pm_clip_velocity(p->vel, p->ground_normal, OVERCLIP);
-    { F32 nv = sqrtf(v3dot(p->vel, p->vel));
-      if (nv > 0.001f) p->vel = v3scale(p->vel, vel / nv); }
-
-    if (p->vel.x == 0 && p->vel.z == 0) return;
-
-    pm_step_slide_move(p, cm, dt, 0);
-}
-
-/* Q3 PM_AirMove: airborne movement */
-static void pm_air_move(Player *p, ColMap *cm, Input in, F32 dt) {
-    pm_friction(p, dt);
-
-    F32 cy = cosf(p->yaw), sy = sinf(p->yaw);
-    V3 fwd = v3(sy, 0, -cy);
-    V3 right = v3(cy, 0, sy);
-
-    V3 wish = v3(0, 0, 0);
-    if (in.fwd)   wish = v3add(wish, fwd);
-    if (in.back)  wish = v3sub(wish, fwd);
-    if (in.right) wish = v3add(wish, right);
-    if (in.left)  wish = v3sub(wish, right);
-    wish.y = 0; /* no vertical wish in air */
-
-    F32 wishspeed = sqrtf(v3dot(wish, wish));
-    if (wishspeed > 0.001f) {
-        wish = v3scale(wish, 1.f / wishspeed);
-        wishspeed = PM_MAXSPEED;
-    }
-    if (p->ducked) wishspeed *= 0.25f;
-
-    pm_accelerate(p, wish, wishspeed, PM_AIRACCELERATE, dt);
-
-    /* slide along steep slopes */
-    if (p->ground_plane)
-        p->vel = pm_clip_velocity(p->vel, p->ground_normal, OVERCLIP);
-
-    pm_step_slide_move(p, cm, dt, 1);
-}
-
-/* Q3 PM_CheckDuck: handle crouch state transitions.
-   Capsule bottoms differ by stance: standing = pos.y-32, crouched = pos.y-16.
-   Adjust pos.y on transitions to keep feet at the same world height. */
-static void pm_check_duck(Player *p, ColMap *cm, Input in) {
-    /* height difference between standing/crouched capsule bottoms */
-    const F32 dh = 16.f; /* (32-15) - (16-15) = 16 */
-    if (in.crouch) {
-        if (!p->ducked) {
-            p->ducked = 1;
-            p->pos.y -= dh; /* lower pos so capsule bottom stays on floor */
-        }
-    } else if (p->ducked) {
-        /* try to stand: test at raised position so standing capsule
-           bottom matches our current crouched capsule bottom */
-        V3 test = v3add(p->pos, v3(0, dh, 0));
-        V3 stand = v3(15, 32, 15);
-        Trace tr = cm_trace(test, test, PM_MINS, stand, cm, 1);
-        if (!tr.allsolid) {
-            p->ducked = 0;
-            p->pos = test;
-        }
-    }
-    p->viewheight = p->ducked ? CROUCH_VIEWHEIGHT : DEFAULT_VIEWHEIGHT;
-}
-
-/* Top-level per-frame player movement */
-static void player_move(Player *p, ColMap *cm, Input in, F32 dt) {
-    /* mouse look */
-    p->yaw += in.dx * 0.003f;
-    p->pitch += in.dy * 0.003f;
-    if (p->pitch >  1.4f) p->pitch =  1.4f;
-    if (p->pitch < -1.4f) p->pitch = -1.4f;
-
-    /* noclip fallback if no collision data */
-    if (!cm || !cm->n_nodes) {
-        F32 cy = cosf(p->yaw), sy = sinf(p->yaw);
-        V3 fwd = v3(sy, 0, -cy);
-        V3 right = v3(cy, 0, sy);
-        V3 move = v3(0, 0, 0);
-        F32 spd = 320.f;
-        if (in.fwd)   move = v3add(move, v3scale(fwd, spd));
-        if (in.back)  move = v3add(move, v3scale(fwd, -spd));
-        if (in.right) move = v3add(move, v3scale(right, spd));
-        if (in.left)  move = v3add(move, v3scale(right, -spd));
-        if (in.jump)  move.y += spd;
-        p->pos = v3add(p->pos, v3scale(move, dt));
-        return;
-    }
-
-    /* crouch state */
-    pm_check_duck(p, cm, in);
-
-    /* pre-move ground trace */
-    pm_ground_trace(p, cm);
-
-    if (p->on_ground) {
-        /* Q3: check jump BEFORE friction/movement */
-        if (in.jump && !p->jump_held) {
-            p->vel.y = JUMP_VELOCITY;
-            p->on_ground = 0;
-            p->ground_plane = 0;
-            pm_air_move(p, cm, in, dt);
-        } else {
-            pm_walk_move(p, cm, in, dt);
-        }
+      // Launch the player upward and switch to air movement for this frame
+      State->Velocity.y    = JUMP_VELOCITY;
+      State->On_Ground     = 0;
+      State->Ground_Plane  = 0;
+      Player_Air_Move (State, Collision, Input_Data, Delta_Time);
     } else {
-        pm_air_move(p, cm, in, dt);
+      Player_Walk_Move (State, Collision, Input_Data, Delta_Time);
     }
+  } else {
+    Player_Air_Move (State, Collision, Input_Data, Delta_Time);
+  }
 
-    /* post-move ground trace (Q3 does this) */
-    pm_ground_trace(p, cm);
-
-    p->jump_held = in.jump;
+  // Re-evaluate ground contact after movement
+  Player_Ground_Trace (State, Collision);
+  State->Jump_Held = Input_Data.Jump;
 }
 
-/* <<scene>> ============================================================= */
+/* <<scene>> ============================================================================================ */
 
-static Scene scene_build_test(void) {
-#define VX(px,py,pz,u,v,nx,ny,nz) {.pos={px,py,pz},.uv={u,v},.n={nx,ny,nz}}
-    static Vtx V[] = {
-        VX(-10,0,-10, 0,1, 0,1,0), VX(10,0,-10, 1,1, 0,1,0),
-        VX( 10,0, 10, 1,0, 0,1,0), VX(-10,0,10, 0,0, 0,1,0),
-        VX(  0,0,  0,.5,.5, 0,0,-1), VX(-2,0,-4, 0,1, 0,0,-1),
-        VX(  2,0, -4, 1,1, 0,0,-1), VX( 0,4,-4,.5, 0, 0,0,-1),
-        VX(  0,4, -4,.5,.5,-1,0,0), VX(-2,0,-4, 0,1,-1,0,0),
-        VX( -2,0,  0, 1,1,-1,0,0),
-        VX(  0,4, -4,.5,.5, 1,0,0), VX( 2,0,-4, 0,1, 1,0,0),
-        VX(  2,0,  0, 1,1, 1,0,0),
-    };
-    static U32 I[] = {
-        0,1,2,  0,2,3,
-        4,5,6,  4,6,7,
-        8,9,10,
-        11,12,13
-    };
-    static V4 M[] = {
-        {0.55f,0.52f,0.48f,1},
-        {0.85f,0.42f,0.15f,1},
-        {0.25f,0.60f,0.85f,1},
-    };
-    static U32 TI[] = {0,0,0,0,0,0}; /* 6 tris, all shader 0 */
-    (void)V[0]; (void)I[0]; (void)M[0]; (void)TI[0];
-    return (Scene){.verts=V,.nv=14,.idxs=I,.ni=18,.mats=M,.nm=3,
-                   .tex_ids=TI,.tex_names=NULL,.tri_count=6};
+/* Build a minimal test scene with a ground plane and a small triangular prism for development. */
+
+Scene Scene_Build_Test (void) {
+  Vertex Test_Vertices[] = {
+    {.Position = {-10, 0, -10}, .Texture_Uv = { 0,  1}, .Normal = { 0, 1,  0}},
+    {.Position = { 10, 0, -10}, .Texture_Uv = { 1,  1}, .Normal = { 0, 1,  0}},
+    {.Position = { 10, 0,  10}, .Texture_Uv = { 1,  0}, .Normal = { 0, 1,  0}},
+    {.Position = {-10, 0,  10}, .Texture_Uv = { 0,  0}, .Normal = { 0, 1,  0}},
+    {.Position = {  0, 0,   0}, .Texture_Uv = {.5, .5}, .Normal = { 0, 0, -1}},
+    {.Position = { -2, 0,  -4}, .Texture_Uv = { 0,  1}, .Normal = { 0, 0, -1}},
+    {.Position = {  2, 0,  -4}, .Texture_Uv = { 1,  1}, .Normal = { 0, 0, -1}},
+    {.Position = {  0, 4,  -4}, .Texture_Uv = {.5,  0}, .Normal = { 0, 0, -1}},
+    {.Position = {  0, 4,  -4}, .Texture_Uv = {.5, .5}, .Normal = {-1, 0,  0}},
+    {.Position = { -2, 0,  -4}, .Texture_Uv = { 0,  1}, .Normal = {-1, 0,  0}},
+    {.Position = { -2, 0,   0}, .Texture_Uv = { 1,  1}, .Normal = {-1, 0,  0}},
+    {.Position = {  0, 4,  -4}, .Texture_Uv = {.5, .5}, .Normal = { 1, 0,  0}},
+    {.Position = {  2, 0,  -4}, .Texture_Uv = { 0,  1}, .Normal = { 1, 0,  0}},
+    {.Position = {  2, 0,   0}, .Texture_Uv = { 1,  1}, .Normal = { 1, 0,  0}},
+  };
+  U32 Test_Indices[]     = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 11, 12, 13 };
+  V4  Test_Materials[]   = {{0.55f, 0.52f, 0.48f, 1}, {0.85f, 0.42f, 0.15f, 1}, {0.25f, 0.60f, 0.85f, 1}};
+  U32 Test_Texture_Ids[] = {0, 0, 0, 0, 0, 0 };
+
+  return (Scene){
+    .Vertices    = Test_Vertices,    .Vertex_Count   = 14,
+    .Indices     = Test_Indices,     .Index_Count    = 18,
+    .Materials   = Test_Materials,   .Material_Count = 3,
+    .Texture_Ids = Test_Texture_Ids, .Triangle_Count = 6, .Texture_Names = NULL
+  };
 }
 
-static void textures_load(Ctx *C, const Scene *sc) {
-    C->tex_sampler = sampler_create(C->dev);
-    C->n_tex = sc->nm;
-    C->n_tex_loaded = 0;
-    C->tex_imgs  = calloc(C->n_tex, sizeof(VkImage));
-    C->tex_mems  = calloc(C->n_tex, sizeof(VkDeviceMemory));
-    C->tex_views = calloc(C->n_tex, sizeof(VkImageView));
+/* Load textures for every material in the scene.  Attempts to load TGA files from the assets
+   directory; materials without a texture file fall back to a 1x1 solid-color pixel derived
+   from the hashed shader name.  Also uploads the lightmap atlas and per-triangle texture IDs. */
 
-    for (U32 i = 0; i < C->n_tex; i++) {
-        U32 w=0, h=0; U8 *rgba = NULL;
-        if (sc->tex_names) {
-            char path[256];
-            snprintf(path, sizeof(path), "assets/%s.tga", sc->tex_names[i]);
-            rgba = tga_load(path, &w, &h);
-        }
-        if (rgba && w && h) {
-            tex_upload(C->dev, C->pd, C->cmd, C->q, rgba, w, h,
-                       &C->tex_imgs[i], &C->tex_mems[i], &C->tex_views[i]);
-            free(rgba);
-            C->n_tex_loaded++;
-        } else {
-            /* 1x1 fallback from hash color */
-            V4 c = sc->mats[i];
-            U8 fb[4] = {(U8)(c.x*255),(U8)(c.y*255),(U8)(c.z*255),255};
-            tex_upload(C->dev, C->pd, C->cmd, C->q, fb, 1, 1,
-                       &C->tex_imgs[i], &C->tex_mems[i], &C->tex_views[i]);
-        }
+void Scene_Load_Textures (Vulkan_Context *Context, const Scene *Scene_Data) {
+  Context->Texture_Sampler  = Sampler_Create_Repeating (Context->Device);
+  Context->Texture_Count    = Scene_Data->Material_Count;
+  Context->Textures_Loaded  = 0;
+  Context->Texture_Images   = calloc (Context->Texture_Count, sizeof (VkImage));
+  Context->Texture_Memories = calloc (Context->Texture_Count, sizeof (VkDeviceMemory));
+  Context->Texture_Views    = calloc (Context->Texture_Count, sizeof (VkImageView));
+
+  // Load each material's TGA texture, or generate a fallback solid-color pixel
+  for (U32 Index = 0; Index < Context->Texture_Count; Index++) {
+    U32 Width = 0, Height = 0;
+    U8 *Pixels = NULL;
+    if (Scene_Data->Texture_Names) {
+      char Path[256];
+      snprintf (Path, sizeof (Path), "assets/%s.tga", Scene_Data->Texture_Names[Index]);
+      Pixels = Tga_Load (Path, &Width, &Height);
     }
-
-    C->tex_id_buf = buf_stage_upload(C->dev, C->pd, C->cmd, C->q,
-        sc->tex_ids, sizeof(U32) * sc->tri_count,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-    printf("[tex] loaded %u/%u textures, %u fallbacks\n",
-           C->n_tex_loaded, C->n_tex, C->n_tex - C->n_tex_loaded);
-
-    /* upload lightmap atlas (UNORM, clamp sampler) or 1x1 white fallback */
-    C->lm_sampler = sampler_clamp_create(C->dev);
-    if (sc->lm_atlas && sc->lm_w && sc->lm_h) {
-        tex_upload_fmt(C->dev, C->pd, C->cmd, C->q,
-                       sc->lm_atlas, sc->lm_w, sc->lm_h,
-                       VK_FORMAT_R8G8B8A8_UNORM,
-                       &C->lm_img, &C->lm_mem, &C->lm_view);
-        printf("[lm] uploaded %ux%u atlas (UNORM)\n", sc->lm_w, sc->lm_h);
+    if (Pixels and Width and Height) {
+      Texture_Upload (/*Device          =>*/ Context->Device,
+                      /*Physical_Device =>*/ Context->Physical_Device,
+                      /*Command_Buffer  =>*/ Context->Command_Buffer,
+                      /*Queue           =>*/ Context->Queue,
+                      /*Pixels          =>*/ Pixels,
+                      /*Width           =>*/ Width,
+                      /*Height          =>*/ Height,
+                      /*Out_Image       =>*/ &Context->Texture_Images[Index],
+                      /*Out_Memory      =>*/ &Context->Texture_Memories[Index],
+                      /*Out_View        =>*/ &Context->Texture_Views[Index]);
+      free (Pixels);
+      Context->Textures_Loaded++;
     } else {
-        U8 white[4] = {255,255,255,255};
-        tex_upload_fmt(C->dev, C->pd, C->cmd, C->q, white, 1, 1,
-                       VK_FORMAT_R8G8B8A8_UNORM,
-                       &C->lm_img, &C->lm_mem, &C->lm_view);
+      V4 Color = Scene_Data->Materials[Index];
+      U8 Fallback[4] = {(U8)(Color.x * 255), (U8)(Color.y * 255), (U8)(Color.z * 255), 255 };
+      Texture_Upload (/*Device          =>*/ Context->Device,
+                      /*Physical_Device =>*/ Context->Physical_Device,
+                      /*Command_Buffer  =>*/ Context->Command_Buffer,
+                      /*Queue           =>*/ Context->Queue,
+                      /*Pixels          =>*/ Fallback,
+                      /*Width           =>*/ 1,
+                      /*Height          =>*/ 1,
+                      /*Out_Image       =>*/ &Context->Texture_Images[Index],
+                      /*Out_Memory      =>*/ &Context->Texture_Memories[Index],
+                      /*Out_View        =>*/ &Context->Texture_Views[Index]);
     }
+  }
+
+  // Upload per-triangle texture IDs as a storage buffer
+  Context->Texture_Id_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context->Device,
+                                                    /*Physical_Device =>*/ Context->Physical_Device,
+                                                    /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                                    /*Queue           =>*/ Context->Queue,
+                                                    /*Data            =>*/ Scene_Data->Texture_Ids,
+                                                    /*Size            =>*/ sizeof (U32) * Scene_Data->Triangle_Count,
+                                                    /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+  printf ("[textures] loaded %u/%u textures,
+          %u fallbacks\n",
+          Context->Textures_Loaded,
+          Context->Texture_Count,
+          Context->Texture_Count - Context->Textures_Loaded);
+
+  // Upload the lightmap atlas (or a 1x1 white fallback if no lightmaps exist)
+  Context->Lightmap_Sampler = Sampler_Create_Clamping (Context->Device);
+  if (Scene_Data->Lightmap_Atlas and Scene_Data->Lightmap_Width and Scene_Data->Lightmap_Height) {
+    Texture_Upload_With_Format (/*Device          =>*/ Context->Device,
+                                /*Physical_Device =>*/ Context->Physical_Device,
+                                /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                /*Queue           =>*/ Context->Queue,
+                                /*Pixels          =>*/ Scene_Data->Lightmap_Atlas,
+                                /*Width           =>*/ Scene_Data->Lightmap_Width,
+                                /*Height          =>*/ Scene_Data->Lightmap_Height,
+                                /*Format          =>*/ VK_FORMAT_R8G8B8A8_UNORM,
+                                /*Out_Image       =>*/ &Context->Lightmap_Image,
+                                /*Out_Memory      =>*/ &Context->Lightmap_Memory,
+                                /*Out_View        =>*/ &Context->Lightmap_View);
+    printf ("[lightmap] uploaded %ux%u atlas (UNORM)\n", Scene_Data->Lightmap_Width, Scene_Data->Lightmap_Height);
+  } else {
+    U8 White[4] = {255, 255, 255, 255 };
+    Texture_Upload_With_Format (/*Device          =>*/ Context->Device,
+                                /*Physical_Device =>*/ Context->Physical_Device,
+                                /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                /*Queue           =>*/ Context->Queue,
+                                /*Pixels          =>*/ White,
+                                /*Width           =>*/ 1,
+                                /*Height          =>*/ 1,
+                                /*Format          =>*/ VK_FORMAT_R8G8B8A8_UNORM,
+                                /*Out_Image       =>*/ &Context->Lightmap_Image,
+                                /*Out_Memory      =>*/ &Context->Lightmap_Memory,
+                                /*Out_View        =>*/ &Context->Lightmap_View);
+  }
 }
 
-static void wpn_textures_load(Ctx *C, Wpn *wpn) {
-    /* weapon texture names: body surfaces + barrel fallback to surface 0 */
-    const char *wpn_tex_paths[] = {
-        "assets/models/weapons2/machinegun/mgun.tga",
-        "assets/models/weapons2/machinegun/sight.tga",
-    };
-    U32 n_wpn_tex = 2;
-    wpn->wpn_tex_base = C->n_tex;
+/* Load the weapon model's TGA textures and append them to the global texture array. */
 
-    /* grow texture arrays */
-    U32 new_total = C->n_tex + n_wpn_tex;
-    C->tex_imgs  = realloc(C->tex_imgs,  sizeof(VkImage)        * new_total);
-    C->tex_mems  = realloc(C->tex_mems,  sizeof(VkDeviceMemory) * new_total);
-    C->tex_views = realloc(C->tex_views, sizeof(VkImageView)    * new_total);
+void Weapon_Load_Textures (Vulkan_Context *Context, Weapon_Instance *Weapon) {
 
-    for (U32 i = 0; i < n_wpn_tex; i++) {
-        U32 w=0, h=0;
-        U8 *rgba = tga_load(wpn_tex_paths[i], &w, &h);
-        if (rgba && w && h) {
-            tex_upload(C->dev, C->pd, C->cmd, C->q, rgba, w, h,
-                       &C->tex_imgs[C->n_tex], &C->tex_mems[C->n_tex],
-                       &C->tex_views[C->n_tex]);
-            free(rgba);
-            printf("[wpn] loaded tex %s (%ux%u)\n", wpn_tex_paths[i], w, h);
-        } else {
-            U8 fb[4] = {180, 180, 180, 255};
-            tex_upload(C->dev, C->pd, C->cmd, C->q, fb, 1, 1,
-                       &C->tex_imgs[C->n_tex], &C->tex_mems[C->n_tex],
-                       &C->tex_views[C->n_tex]);
-            printf("[wpn] fallback tex for %s\n", wpn_tex_paths[i]);
-        }
-        C->n_tex++;
+  // Comment here !!!
+  const char *Weapon_Texture_Paths[] = {
+    "assets/models/weapons2/machinegun/mgun.tga",
+    "assets/models/weapons2/machinegun/sight.tga",
+  };
+  U32 Weapon_Texture_Count   = 2;
+  Weapon->Texture_Base_Index = Context->Texture_Count;
+
+  // Grow the global texture arrays to accommodate the weapon textures
+  U32 New_Total = Context->Texture_Count + Weapon_Texture_Count;
+  Context->Texture_Images   = realloc (Context->Texture_Images,   sizeof (VkImage)        * New_Total);
+  Context->Texture_Memories = realloc (Context->Texture_Memories, sizeof (VkDeviceMemory)  * New_Total);
+  Context->Texture_Views    = realloc (Context->Texture_Views,    sizeof (VkImageView)     * New_Total);
+
+  // Comment here !!!
+  for (U32 Index = 0; Index < Weapon_Texture_Count; Index++) {
+    U32 Width = 0, Height = 0;
+    U8 *Pixels = Tga_Load (Weapon_Texture_Paths[Index], &Width, &Height);
+    if (Pixels and Width and Height) {
+      Texture_Upload (/*Device          =>*/ Context->Device,
+                      /*Physical_Device =>*/ Context->Physical_Device,
+                      /*Command_Buffer  =>*/ Context->Command_Buffer,
+                      /*Queue           =>*/ Context->Queue,
+                      /*Pixels          =>*/ Pixels,
+                      /*Width           =>*/ Width,
+                      /*Height          =>*/ Height,
+                      /*Out_Image       =>*/ &Context->Texture_Images[Context->Texture_Count],
+                      /*Out_Memory      =>*/ &Context->Texture_Memories[Context->Texture_Count],
+                      /*Out_View        =>*/ &Context->Texture_Views[Context->Texture_Count]);
+      free (Pixels);
+      printf ("[weapon] loaded texture %s (%ux%u)\n", Weapon_Texture_Paths[Index], Width, Height);
+
+    // Comment here !!!
+    } else {
+      U8 Fallback[4] = {180, 180, 180, 255 };
+      Texture_Upload (/*Device          =>*/ Context->Device,
+                      /*Physical_Device =>*/ Context->Physical_Device,
+                      /*Command_Buffer  =>*/ Context->Command_Buffer,
+                      /*Queue           =>*/ Context->Queue,
+                      /*Pixels          =>*/ Fallback,
+                      /*Width           =>*/ 1,
+                      /*Height          =>*/ 1,
+                      /*Out_Image       =>*/ &Context->Texture_Images[Context->Texture_Count],
+                      /*Out_Memory      =>*/ &Context->Texture_Memories[Context->Texture_Count],
+                      /*Out_View        =>*/ &Context->Texture_Views[Context->Texture_Count]);
+      printf ("[weapon] fallback texture for %s\n", Weapon_Texture_Paths[Index]);
     }
-    printf("[wpn] textures: base=%u, count=%u\n", wpn->wpn_tex_base, n_wpn_tex);
+    Context->Texture_Count++;
+  }
+  printf ("[weapon] textures: base=%u, count=%u\n", Weapon->Texture_Base_Index, Weapon_Texture_Count);
 }
 
-/* <<blas>> ============================================================== */
+/* <<bottom_level_acceleration>> ======================================================================== */
 
-static AS blas_build(Ctx *C, const Scene *S) {
-    C->vbuf = buf_stage_upload(C->dev, C->pd, C->cmd, C->q,
-        S->verts, sizeof(Vtx)*S->nv,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
-    C->ibuf = buf_stage_upload(C->dev, C->pd, C->cmd, C->q,
-        S->idxs, sizeof(U32)*S->ni,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
-    C->mbuf = buf_alloc(C->dev, C->pd, sizeof(V4)*S->nm,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    buf_upload(C->dev, C->mbuf, S->mats, sizeof(V4)*S->nm);
+/* Build the world geometry's bottom-level acceleration structure (BLAS).  Uploads the scene
+   vertex, index, and material buffers to the GPU, then constructs a single BLAS geometry
+   entry covering all triangles.  Uses PREFER_FAST_TRACE since the world is static. */
 
-    VkAccelerationStructureGeometryKHR geom = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
-        .geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR,
-        .flags=VK_GEOMETRY_OPAQUE_BIT_KHR,
-        .geometry.triangles={
-            .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
-            .vertexFormat=VK_FORMAT_R32G32B32_SFLOAT,
-            .vertexData.deviceAddress=C->vbuf.a,
-            .vertexStride=sizeof(Vtx),
-            .maxVertex=S->nv-1,
-            .indexType=VK_INDEX_TYPE_UINT32,
-            .indexData.deviceAddress=C->ibuf.a,
-        }
-    };
-    VkAccelerationStructureBuildGeometryInfoKHR bgi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-        .flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
-        .geometryCount=1, .pGeometries=&geom
-    };
-    U32 prim_count = S->tri_count;
-    VkAccelerationStructureBuildSizesInfoKHR bsi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    C->rt.ASBuildSizes(C->dev,
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bgi, &prim_count, &bsi);
+Acceleration_Structure Build_World_Bottom_Level (Vulkan_Context *Context, const Scene *Scene_Data) {
 
-    AS as = {0};
-    as.b = buf_alloc(C->dev, C->pd, bsi.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK(C->rt.CreateAS(C->dev, &(VkAccelerationStructureCreateInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-        .buffer=as.b.b, .size=bsi.accelerationStructureSize,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
-    }, NULL, &as.h));
+  // Upload scene vertex, index, and material data to device-local GPU buffers
+  Context->Vertex_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context->Device,
+                                                /*Physical_Device =>*/ Context->Physical_Device,
+                                                /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                                /*Queue           =>*/ Context->Queue,
+                                                /*Data            =>*/ Scene_Data->Vertices,
+                                                /*Size            =>*/ sizeof (Vertex) * Scene_Data->Vertex_Count,
+                                                /*Usage           =>*/ VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
 
-    Buf scratch = buf_alloc(C->dev, C->pd, bsi.buildScratchSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  // Comment here !!!
+  Context->Index_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context->Device,
+                                               /*Physical_Device =>*/ Context->Physical_Device,
+                                               /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                               /*Queue           =>*/ Context->Queue,
+                                               /*Data            =>*/ Scene_Data->Indices,
+                                               /*Size            =>*/ sizeof (U32) * Scene_Data->Index_Count,
+                                               /*Usage           =>*/ VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
 
-    bgi.dstAccelerationStructure  = as.h;
-    bgi.scratchData.deviceAddress = scratch.a;
+  // Comment here !!!
+  Context->Material_Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                              /*Physical_Device =>*/ Context->Physical_Device,
+                                              /*Size            =>*/ sizeof (V4) * Scene_Data->Material_Count,
+                                              /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                              /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount=prim_count};
-    const VkAccelerationStructureBuildRangeInfoKHR *p_range = &range;
+  // Comment here !!!
+  Buffer_Upload (Context->Device, Context->Material_Buffer, Scene_Data->Materials, sizeof (V4) * Scene_Data->Material_Count);
 
-    VK(vkResetCommandBuffer(C->cmd, 0));
-    VK(vkBeginCommandBuffer(C->cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    C->rt.CmdBuildAS(C->cmd, 1, &bgi, &p_range);
-    VK(vkEndCommandBuffer(C->cmd));
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(C->q));
+  // Define the triangle geometry referencing the uploaded vertex and index buffers
+  VkAccelerationStructureGeometryKHR Geometry = {
+    .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+    .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+    .flags        = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    .geometry.triangles = {
+      .sType                       = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+      .vertexFormat                = VK_FORMAT_R32G32B32_SFLOAT,
+      .vertexData.deviceAddress    = Context->Vertex_Buffer.Address,
+      .vertexStride                = sizeof (Vertex),
+      .maxVertex                   = Scene_Data->Vertex_Count - 1,
+      .indexType                   = VK_INDEX_TYPE_UINT32,
+      .indexData.deviceAddress     = Context->Index_Buffer.Address,
+    },
+  };
 
-    as.a = C->rt.ASAddr(C->dev, &(VkAccelerationStructureDeviceAddressInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-        .accelerationStructure=as.h
+  // Query the required buffer sizes for the acceleration structure and scratch memory
+  VkAccelerationStructureBuildGeometryInfoKHR Build_Info = {
+    .sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+    .type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    .flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+    .geometryCount = 1,
+    .pGeometries   = &Geometry,
+  };
+
+  // Comment here !!!
+  U32 Primitive_Count = Scene_Data->Triangle_Count;
+  VkAccelerationStructureBuildSizesInfoKHR Build_Sizes = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+  Context->Raytracing.Get_Build_Sizes (Context->Device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &Build_Info, &Primitive_Count, &Build_Sizes);
+
+  // Allocate the acceleration structure buffer and create the BLAS object
+  Acceleration_Structure Result = {0};
+  Result.Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                   /*Physical_Device =>*/ Context->Physical_Device,
+                                   /*Size            =>*/ Build_Sizes.accelerationStructureSize,
+                                   /*Usage           =>*/ VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                   /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Comment here !!!
+  VK_CHECK (Context->Raytracing.Create_Acceleration_Structure (/*device                 =>*/ Context->Device,
+                                                               /*pCreateInfo            =>*/ &(VkAccelerationStructureCreateInfoKHR){
+                                                                 .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+                                                                 .buffer = Result.Buffer.Buffer,
+                                                                 .size   = Build_Sizes.accelerationStructureSize,
+                                                                 .type   = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+                                                               },
+                                                               /*pAllocator             =>*/ NULL,
+                                                               /*pAccelerationStructure =>*/ &Result.Handle));
+
+  // Allocate scratch memory for the build operation
+  Gpu_Buffer Scratch = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                        /*Physical_Device =>*/ Context->Physical_Device,
+                                        /*Size            =>*/ Build_Sizes.buildScratchSize,
+                                        /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                        /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Build the BLAS via a one-shot command buffer
+  Build_Info.dstAccelerationStructure  = Result.Handle;
+  Build_Info.scratchData.deviceAddress = Scratch.Address;
+
+  // Comment here !!!
+  VkAccelerationStructureBuildRangeInfoKHR Range = {.primitiveCount = Primitive_Count };
+  const VkAccelerationStructureBuildRangeInfoKHR *Range_Pointer = &Range;
+
+  // Comment here !!!
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){
+                                    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+                                  }));
+
+  // Comment here !!!
+  Context->Raytracing.Command_Build (Context->Command_Buffer, 1, &Build_Info, &Range_Pointer);
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+                             .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                             .commandBufferCount = 1,
+                             .pCommandBuffers    = &Context->Command_Buffer
+                           },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+
+  // Comment here !!!
+  VK_CHECK (vkQueueWaitIdle (Context->Queue));
+
+  // Query the device address of the built BLAS for referencing from the TLAS
+  Result.Address = Context->Raytracing.Get_Device_Address (/*device =>*/ Context->Device,
+                                                           /*pInfo  =>*/ &(VkAccelerationStructureDeviceAddressInfoKHR){
+      .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+      .accelerationStructure = Result.Handle,
     });
 
-    vkDestroyBuffer(C->dev,scratch.b,NULL);
-    vkFreeMemory(C->dev,scratch.m,NULL);
-    return as;
+  // Free the scratch buffer (no longer needed after the build)
+  vkDestroyBuffer (Context->Device, Scratch.Buffer, NULL);
+  vkFreeMemory (Context->Device, Scratch.Memory, NULL);
+  return Result;
 }
 
-static void wpn_blas_init(Ctx *C, Wpn *w) {
-    if (!w->mdl.nv) return;
-    w->xverts = malloc(sizeof(Vtx) * w->mdl.nv);
-    memcpy(w->xverts, w->mdl.verts, sizeof(Vtx) * w->mdl.nv);
+/* Initialize the weapon's BLAS with host-visible vertex buffer (for per-frame updates)
+   and ALLOW_UPDATE flag for fast rebuilds.  Scratch memory is kept alive for reuse. */
 
-    /* host-visible vertex buffer (updated each frame) */
-    w->vbuf = buf_alloc(C->dev, C->pd, sizeof(Vtx) * w->mdl.nv,
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    buf_upload(C->dev, w->vbuf, w->xverts, sizeof(Vtx) * w->mdl.nv);
+void Weapon_Bottom_Level_Initialize (Vulkan_Context *Context, Weapon_Instance *Weapon) {
+  if (not Weapon->Model.Vertex_Count) return;
 
-    /* device-local index buffer (uploaded once) */
-    w->ibuf = buf_stage_upload(C->dev, C->pd, C->cmd, C->q,
-        w->mdl.idxs, sizeof(U32) * w->mdl.ni,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+  // Allocate a host-visible copy of the weapon vertices for per-frame CPU transformation
+  Weapon->Transformed_Vertices = malloc (sizeof (Vertex) * Weapon->Model.Vertex_Count);
+  memcpy (Weapon->Transformed_Vertices, Weapon->Model.Vertices, sizeof (Vertex) * Weapon->Model.Vertex_Count);
 
-    /* tex_id buffer */
-    w->tid_buf = buf_stage_upload(C->dev, C->pd, C->cmd, C->q,
-        w->mdl.tex_ids, sizeof(U32) * w->mdl.ntri,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  // Create host-visible vertex buffer for direct CPU writes each frame
+  Weapon->Vertex_Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                           /*Physical_Device =>*/ Context->Physical_Device,
+                                           /*Size            =>*/ sizeof (Vertex) * Weapon->Model.Vertex_Count,
+                                           /*Usage           =>*/ VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                                                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                                                | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                                                                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                           /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                                | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    /* build initial BLAS with PREFER_FAST_BUILD */
-    VkAccelerationStructureGeometryKHR geom = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
-        .geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR,
-        .flags=VK_GEOMETRY_OPAQUE_BIT_KHR,
-        .geometry.triangles={
-            .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
-            .vertexFormat=VK_FORMAT_R32G32B32_SFLOAT,
-            .vertexData.deviceAddress=w->vbuf.a,
-            .vertexStride=sizeof(Vtx),
-            .maxVertex=w->mdl.nv-1,
-            .indexType=VK_INDEX_TYPE_UINT32,
-            .indexData.deviceAddress=w->ibuf.a,
-        }
-    };
-    VkAccelerationStructureBuildGeometryInfoKHR bgi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-        .flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR |
-               VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
-        .geometryCount=1, .pGeometries=&geom
-    };
-    U32 prim_count = w->mdl.ntri;
-    VkAccelerationStructureBuildSizesInfoKHR bsi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    C->rt.ASBuildSizes(C->dev,
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bgi, &prim_count, &bsi);
+  // Comment here !!!
+  Buffer_Upload (Context->Device, Weapon->Vertex_Buffer, Weapon->Transformed_Vertices, sizeof (Vertex) * Weapon->Model.Vertex_Count);
 
-    w->blas.b = buf_alloc(C->dev, C->pd, bsi.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK(C->rt.CreateAS(C->dev, &(VkAccelerationStructureCreateInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-        .buffer=w->blas.b.b, .size=bsi.accelerationStructureSize,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
-    }, NULL, &w->blas.h));
+  // Upload index and texture-id data (static, device-local)
+  Weapon->Index_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context->Device,
+                                              /*Physical_Device =>*/ Context->Physical_Device,
+                                              /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                              /*Queue           =>*/ Context->Queue,
+                                              /*Data            =>*/ Weapon->Model.Indices,
+                                              /*Size            =>*/ sizeof (U32) * Weapon->Model.Index_Count,
+                                              /*Usage           =>*/ VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                                                                   | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                                                   | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
 
-    /* persistent scratch buffer for rebuilds */
-    w->blas_scratch = buf_alloc(C->dev, C->pd, bsi.buildScratchSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  Weapon->Texture_Id_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context->Device,
+                                                   /*Physical_Device =>*/ Context->Physical_Device,
+                                                   /*Command_Buffer  =>*/ Context->Command_Buffer,
+                                                   /*Queue           =>*/ Context->Queue,
+                                                   /*Data            =>*/ Weapon->Model.Texture_Ids,
+                                                   /*Size            =>*/ sizeof (U32) * Weapon->Model.Triangle_Count,
+                                                   /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-    bgi.dstAccelerationStructure  = w->blas.h;
-    bgi.scratchData.deviceAddress = w->blas_scratch.a;
+  // Configure the BLAS for fast builds with update capability
+  VkAccelerationStructureGeometryKHR Geometry = {
+    .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+    .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+    .flags        = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    .geometry.triangles = {
+      .sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+      .vertexFormat             = VK_FORMAT_R32G32B32_SFLOAT,
+      .vertexData.deviceAddress = Weapon->Vertex_Buffer.Address,
+      .vertexStride             = sizeof (Vertex),
+      .maxVertex                = Weapon->Model.Vertex_Count - 1,
+      .indexType                = VK_INDEX_TYPE_UINT32,
+      .indexData.deviceAddress  = Weapon->Index_Buffer.Address,
+    },
+  };
 
-    VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount=prim_count};
-    const VkAccelerationStructureBuildRangeInfoKHR *p_range = &range;
-    VK(vkResetCommandBuffer(C->cmd, 0));
-    VK(vkBeginCommandBuffer(C->cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    C->rt.CmdBuildAS(C->cmd, 1, &bgi, &p_range);
-    VK(vkEndCommandBuffer(C->cmd));
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(C->q));
+  // Comment here !!!
+  VkAccelerationStructureBuildGeometryInfoKHR Build_Info = {
+    .sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+    .type          = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    .flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR
+                   | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
+    .geometryCount = 1,
+    .pGeometries   = &Geometry,
+  };
 
-    w->blas.a = C->rt.ASAddr(C->dev, &(VkAccelerationStructureDeviceAddressInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-        .accelerationStructure=w->blas.h
-    });
-    printf("[wpn] BLAS built: %u tris\n", prim_count);
+  // Comment here !!!
+  U32 Primitive_Count = Weapon->Model.Triangle_Count;
+  VkAccelerationStructureBuildSizesInfoKHR Build_Sizes = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+  Context->Raytracing.Get_Build_Sizes (Context->Device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &Build_Info, &Primitive_Count, &Build_Sizes);
+
+  // Allocate the BLAS buffer and persistent scratch buffer
+  Weapon->Bottom_Level.Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                                 /*Physical_Device =>*/ Context->Physical_Device,
+                                                 /*Size            =>*/ Build_Sizes.accelerationStructureSize,
+                                                 /*Usage           =>*/ VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                                                                      | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                 /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VK_CHECK (Context->Raytracing.Create_Acceleration_Structure (/*device                 =>*/ Context->Device,
+                                                               /*pCreateInfo            =>*/ &(VkAccelerationStructureCreateInfoKHR){
+                                                                 .sType  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+                                                                 .buffer = Weapon->Bottom_Level.Buffer.Buffer,
+                                                                 .size  = Build_Sizes.accelerationStructureSize,
+                                                                 .type  = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+                                                               },
+                                                               /*pAllocator             =>*/ NULL,
+                                                               /*pAccelerationStructure =>*/ &Weapon->Bottom_Level.Handle));
+  Weapon->Bottom_Level_Scratch = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                                  /*Physical_Device =>*/ Context->Physical_Device,
+                                                  /*Size            =>*/ Build_Sizes.buildScratchSize,
+                                                  /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                                                       | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                  /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Perform the initial BLAS build
+  Build_Info.dstAccelerationStructure  = Weapon->Bottom_Level.Handle;
+  Build_Info.scratchData.deviceAddress = Weapon->Bottom_Level_Scratch.Address;
+
+  VkAccelerationStructureBuildRangeInfoKHR Range = {.primitiveCount = Primitive_Count };
+  const VkAccelerationStructureBuildRangeInfoKHR *Range_Pointer = &Range;
+
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT }));
+  Context->Raytracing.Command_Build (Context->Command_Buffer, 1, &Build_Info, &Range_Pointer);
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+                             .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                             .commandBufferCount = 1,
+                             .pCommandBuffers    = &Context->Command_Buffer
+                           },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Context->Queue));
+
+  Weapon->Bottom_Level.Address = Context->Raytracing.Get_Device_Address (/*device =>*/ Context->Device,
+                                                                         /*pInfo  =>*/ &(VkAccelerationStructureDeviceAddressInfoKHR){
+                                                                           .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                                                                           .accelerationStructure = Weapon->Bottom_Level.Handle,
+                                                                         });
+
+  printf ("[weapon] BLAS built: %u triangles\n", Primitive_Count);
 }
 
-static void wpn_blas_rebuild(Ctx *C, Wpn *w) {
-    if (!w->mdl.nv) return;
-    buf_upload(C->dev, w->vbuf, w->xverts, sizeof(Vtx) * w->mdl.nv);
+/* Rebuild the weapon BLAS from scratch after CPU vertex transformation.
+   Re-uploads the vertex buffer and performs a full (non-update) rebuild. */
 
-    VkAccelerationStructureGeometryKHR geom = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
-        .geometryType=VK_GEOMETRY_TYPE_TRIANGLES_KHR,
-        .flags=VK_GEOMETRY_OPAQUE_BIT_KHR,
-        .geometry.triangles={
-            .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
-            .vertexFormat=VK_FORMAT_R32G32B32_SFLOAT,
-            .vertexData.deviceAddress=w->vbuf.a,
-            .vertexStride=sizeof(Vtx),
-            .maxVertex=w->mdl.nv-1,
-            .indexType=VK_INDEX_TYPE_UINT32,
-            .indexData.deviceAddress=w->ibuf.a,
-        }
-    };
-    VkAccelerationStructureBuildGeometryInfoKHR bgi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
-        .flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR |
-               VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
-        .mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
-        .srcAccelerationStructure=VK_NULL_HANDLE,
-        .dstAccelerationStructure=w->blas.h,
-        .scratchData.deviceAddress=w->blas_scratch.a,
-        .geometryCount=1, .pGeometries=&geom
-    };
-    VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount=w->mdl.ntri};
-    const VkAccelerationStructureBuildRangeInfoKHR *p_range = &range;
-    VK(vkResetCommandBuffer(C->cmd, 0));
-    VK(vkBeginCommandBuffer(C->cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    C->rt.CmdBuildAS(C->cmd, 1, &bgi, &p_range);
-    VK(vkEndCommandBuffer(C->cmd));
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(C->q));
+void Weapon_Bottom_Level_Rebuild (Vulkan_Context *Context, Weapon_Instance *Weapon) {
+  if (not Weapon->Model.Vertex_Count) return;
+
+  // Re-upload the transformed vertices to the GPU
+  Buffer_Upload (Context->Device, Weapon->Vertex_Buffer, Weapon->Transformed_Vertices, sizeof (Vertex) * Weapon->Model.Vertex_Count);
+
+  // Rebuild the BLAS with the updated vertex positions
+  VkAccelerationStructureGeometryKHR Geometry = {
+    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+    .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+    .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    .geometry.triangles = {
+      .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+      .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+      .vertexData.deviceAddress = Weapon->Vertex_Buffer.Address,
+      .vertexStride = sizeof (Vertex),
+      .maxVertex = Weapon->Model.Vertex_Count - 1,
+      .indexType = VK_INDEX_TYPE_UINT32,
+      .indexData.deviceAddress = Weapon->Index_Buffer.Address,
+    },
+  };
+
+  VkAccelerationStructureBuildGeometryInfoKHR Build_Info = {
+    .sType                     = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+    .type                      = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    .flags                     = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR,
+    .mode                      = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+    .srcAccelerationStructure  = VK_NULL_HANDLE,
+    .dstAccelerationStructure  = Weapon->Bottom_Level.Handle,
+    .scratchData.deviceAddress = Weapon->Bottom_Level_Scratch.Address,
+    .geometryCount             = 1,
+    .pGeometries               = &Geometry,
+  };
+
+  VkAccelerationStructureBuildRangeInfoKHR Range = {.primitiveCount = Weapon->Model.Triangle_Count };
+  const VkAccelerationStructureBuildRangeInfoKHR *Range_Pointer = &Range;
+
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT }));
+  Context->Raytracing.Command_Build (Context->Command_Buffer, 1, &Build_Info, &Range_Pointer);
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &Context->Command_Buffer },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Context->Queue));
 }
 
-/* <<tlas>> ============================================================== */
+/* <<top_level_acceleration>> =========================================================================== */
 
-static Buf  tlas_inst_buf;
-static Buf  tlas_scratch;
+Gpu_Buffer Top_Level_Instance_Buffer;
+Gpu_Buffer Top_Level_Scratch_Buffer;
 
-static void tlas_init_prealloc(Ctx *C, U32 max_inst) {
-    /* preallocate instance buffer, scratch, and TLAS for per-frame rebuild */
-    tlas_inst_buf = buf_alloc(C->dev, C->pd,
-        sizeof(VkAccelerationStructureInstanceKHR) * max_inst,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+/* Pre-allocate the top-level acceleration structure (TLAS) for up to Maximum_Instances
+   instance entries.  The instance buffer, scratch buffer, and TLAS object are created once
+   and reused across frames.  The TLAS is rebuilt (not updated) each frame. */
 
-    VkAccelerationStructureGeometryKHR geom = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
-        .geometryType=VK_GEOMETRY_TYPE_INSTANCES_KHR,
-        .flags=VK_GEOMETRY_OPAQUE_BIT_KHR,
-        .geometry.instances={
-            .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
-            .arrayOfPointers=VK_FALSE,
-            .data.deviceAddress=tlas_inst_buf.a
-        }
-    };
-    VkAccelerationStructureBuildGeometryInfoKHR bgi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
-        .flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
-        .geometryCount=1, .pGeometries=&geom
-    };
-    VkAccelerationStructureBuildSizesInfoKHR bsi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
-    C->rt.ASBuildSizes(C->dev,
-        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bgi, &max_inst, &bsi);
+void Top_Level_Initialize (Vulkan_Context *Context, U32 Maximum_Instances) {
 
-    C->tlas.b = buf_alloc(C->dev, C->pd, bsi.accelerationStructureSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK(C->rt.CreateAS(C->dev, &(VkAccelerationStructureCreateInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
-        .buffer=C->tlas.b.b, .size=bsi.accelerationStructureSize,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-    }, NULL, &C->tlas.h));
+  // Allocate a host-visible instance buffer large enough for the maximum number of instances
+  Top_Level_Instance_Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                               /*Physical_Device =>*/ Context->Physical_Device,
+                                               /*Size            =>*/ sizeof (VkAccelerationStructureInstanceKHR) * Maximum_Instances,
+                                               /*Usage           =>*/ VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                                                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                               /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    tlas_scratch = buf_alloc(C->dev, C->pd, bsi.buildScratchSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  // Query the required sizes for the TLAS and its scratch buffer
+  VkAccelerationStructureGeometryKHR Geometry = {
+    .sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+    .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+    .flags        = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    .geometry.instances = {
+      .sType              = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+      .arrayOfPointers    = VK_FALSE,
+      .data.deviceAddress = Top_Level_Instance_Buffer.Address,
+    },
+  };
 
-    C->tlas.a = C->rt.ASAddr(C->dev, &(VkAccelerationStructureDeviceAddressInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
-        .accelerationStructure=C->tlas.h
-    });
+  VkAccelerationStructureBuildGeometryInfoKHR Build_Info = {
+    .sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+    .type          = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+    .flags         = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
+    .geometryCount = 1,
+    .pGeometries   = &Geometry,
+  };
+
+  VkAccelerationStructureBuildSizesInfoKHR Build_Sizes = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+  Context->Raytracing.Get_Build_Sizes (Context->Device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &Build_Info, &Maximum_Instances, &Build_Sizes);
+
+  // Allocate the TLAS storage and create the acceleration structure object
+  Context->Top_Level.Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                               /*Physical_Device =>*/ Context->Physical_Device,
+                                               /*Size            =>*/ Build_Sizes.accelerationStructureSize,
+                                               /*Usage           =>*/ VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                                                                    | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                               /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Comment here !!!
+  VK_CHECK (Context->Raytracing.Create_Acceleration_Structure (/*device                 =>*/ Context->Device,
+                                                               /*pCreateInfo            =>*/ &(VkAccelerationStructureCreateInfoKHR){
+                                                                 .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+                                                                 .buffer = Context->Top_Level.Buffer.Buffer,
+                                                                 .size = Build_Sizes.accelerationStructureSize,
+                                                                 .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+                                                               },
+                                                               /*pAllocator             =>*/ NULL,
+                                                               /*pAccelerationStructure =>*/ &Context->Top_Level.Handle));
+
+  // Allocate persistent scratch memory for per-frame rebuilds
+  Top_Level_Scratch_Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                              /*Physical_Device =>*/ Context->Physical_Device,
+                                              /*Size            =>*/ Build_Sizes.buildScratchSize,
+                                              /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                                                   | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                              /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+  // Comment here !!!
+  Context->Top_Level.Address = Context->Raytracing.Get_Device_Address (/*device =>*/ Context->Device,
+                                                                       /*pInfo  =>*/ &(VkAccelerationStructureDeviceAddressInfoKHR){
+                                                                         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+                                                                         .accelerationStructure = Context->Top_Level.Handle,
+                                                                       });
 }
 
-static void tlas_rebuild(Ctx *C, AS *world_blas, AS *wpn_blas) {
-    VkAccelerationStructureInstanceKHR insts[2];
-    memset(insts, 0, sizeof(insts));
-    /* instance 0: world (mask=0xFF, customIdx=0) */
-    insts[0].transform.matrix[0][0] = insts[0].transform.matrix[1][1] =
-    insts[0].transform.matrix[2][2] = 1.f;
-    insts[0].mask = 0xFF;
-    insts[0].instanceCustomIndex = 0;
-    insts[0].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    insts[0].accelerationStructureReference = world_blas->a;
+/* Rebuild the TLAS each frame with the world BLAS as instance 0 (mask 0xFF) and optionally
+   the weapon BLAS as instance 1 (mask 0x01, so shadow rays can skip it). */
 
-    U32 n_inst = 1;
-    if (wpn_blas && wpn_blas->h) {
-        /* instance 1: weapon (mask=0x01, customIdx=1) — excluded from shadow rays */
-        insts[1].transform.matrix[0][0] = insts[1].transform.matrix[1][1] =
-        insts[1].transform.matrix[2][2] = 1.f;
-        insts[1].mask = 0x01;
-        insts[1].instanceCustomIndex = 1;
-        insts[1].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        insts[1].accelerationStructureReference = wpn_blas->a;
-        n_inst = 2;
+void Top_Level_Rebuild (Vulkan_Context *Context, Acceleration_Structure *World, Acceleration_Structure *Weapon) {
+  VkAccelerationStructureInstanceKHR Instances[2];
+  memset (Instances, 0, sizeof (Instances));
+
+  // Instance 0: the world geometry with identity transform
+  Instances[0].transform.matrix[0][0]          = 1.f;
+  Instances[0].transform.matrix[1][1]          = 1.f;
+  Instances[0].transform.matrix[2][2]          = 1.f;
+  Instances[0].mask                            = 0xFF;
+  Instances[0].instanceCustomIndex             = 0;
+  Instances[0].flags                           = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+  Instances[0].accelerationStructureReference  = World->Address;
+
+  U32 Instance_Count = 1;
+
+  // Instance 1 (optional): the weapon viewmodel, excluded from shadow rays via mask
+  if (Weapon and Weapon->Handle) {
+    Instances[1].transform.matrix[0][0]          = 1.f;
+    Instances[1].transform.matrix[1][1]          = 1.f;
+    Instances[1].transform.matrix[2][2]          = 1.f;
+    Instances[1].mask                            = 0x01;
+    Instances[1].instanceCustomIndex             = 1;
+    Instances[1].flags                           = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    Instances[1].accelerationStructureReference  = Weapon->Address;
+    Instance_Count = 2;
+  }
+
+  // Upload the instance data and rebuild the TLAS
+  Buffer_Upload (Context->Device, Top_Level_Instance_Buffer, Instances, sizeof (VkAccelerationStructureInstanceKHR) * Instance_Count);
+
+  VkAccelerationStructureGeometryKHR Geometry = {
+    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+    .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+    .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+    .geometry.instances = {
+      .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+      .arrayOfPointers = VK_FALSE,
+      .data.deviceAddress = Top_Level_Instance_Buffer.Address,
+    },
+  };
+
+  VkAccelerationStructureBuildGeometryInfoKHR Build_Info = {
+    .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+    .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+    .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
+    .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+    .dstAccelerationStructure = Context->Top_Level.Handle,
+    .scratchData.deviceAddress = Top_Level_Scratch_Buffer.Address,
+    .geometryCount = 1,
+    .pGeometries = &Geometry,
+  };
+
+  VkAccelerationStructureBuildRangeInfoKHR Range = {.primitiveCount = Instance_Count };
+  const VkAccelerationStructureBuildRangeInfoKHR *Range_Pointer = &Range;
+
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT }));
+  Context->Raytracing.Command_Build (Context->Command_Buffer, 1, &Build_Info, &Range_Pointer);
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &Context->Command_Buffer },
+                           /*fence       =>*/ VK_NULL_HANDLE));
+  VK_CHECK (vkQueueWaitIdle (Context->Queue));
+}
+
+/* <<pipeline>> ========================================================================================= */
+
+/* Create the ray tracing pipeline with four shader stages: ray generation, primary miss,
+   shadow miss, and closest-hit.  The descriptor set layout defines 12 bindings covering
+   the TLAS, storage image, camera uniform, vertex/index/material/texture-id buffers,
+   lightmap sampler, weapon buffers, and a variable-count texture array. */
+
+void Raytracing_Pipeline_Create (Vulkan_Context *Context) {
+
+  // Define the 12 descriptor bindings for the ray tracing pipeline
+  VkDescriptorSetLayoutBinding Bindings[] = {
+    {0,  VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,   VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {1,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1,   VK_SHADER_STAGE_RAYGEN_BIT_KHR },
+    {2,  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1,   VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {3,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {4,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {5,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {6,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {7,  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {8,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {9,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             1,   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+    {11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     256, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR },
+  };
+
+  // The last binding (texture array) uses partially-bound and variable-count flags
+  VkDescriptorBindingFlags Binding_Flags[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+  };
+
+  VkDescriptorSetLayoutBindingFlagsCreateInfo Binding_Flags_Info = {
+    .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+    .bindingCount  = 12,
+    .pBindingFlags = Binding_Flags,
+  };
+
+  VK_CHECK (vkCreateDescriptorSetLayout (/*device      =>*/ Context->Device,
+                                         /*pCreateInfo =>*/ &(VkDescriptorSetLayoutCreateInfo){
+      .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .pNext        = &Binding_Flags_Info,
+      .bindingCount = 12,
+      .pBindings    = Bindings,
+    },
+                                         /*pAllocator  =>*/ NULL,
+                                         /*pSetLayout  =>*/ &Context->Descriptor_Set_Layout));
+
+  VK_CHECK (vkCreatePipelineLayout (/*device          =>*/ Context->Device,
+                                    /*pCreateInfo     =>*/ &(VkPipelineLayoutCreateInfo){
+      .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1,
+      .pSetLayouts    = &Context->Descriptor_Set_Layout,
+    },
+                                    /*pAllocator      =>*/ NULL,
+                                    /*pPipelineLayout =>*/ &Context->Pipeline_Layout));
+
+  // Load the four SPIR-V shader modules
+  VkShaderModule Ray_Generation = Shader_Module_Load (Context->Device, "build/shaders/rgen.spv");
+  VkShaderModule Closest_Hit    = Shader_Module_Load (Context->Device, "build/shaders/rchit.spv");
+  VkShaderModule Primary_Miss   = Shader_Module_Load (Context->Device, "build/shaders/rmiss.spv");
+  VkShaderModule Shadow_Miss    = Shader_Module_Load (Context->Device, "build/shaders/shadow.rmiss.spv");
+
+  // Define the pipeline shader stages
+  VkPipelineShaderStageCreateInfo Stages[] = {
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_RAYGEN_BIT_KHR,      Ray_Generation, "main", NULL },
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_MISS_BIT_KHR,        Primary_Miss,   "main", NULL },
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_MISS_BIT_KHR,        Shadow_Miss,    "main", NULL },
+    {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR, Closest_Hit,    "main", NULL },
+  };
+
+  // Define the shader groups: raygen, two miss shaders, and one hit group
+  VkRayTracingShaderGroupCreateInfoKHR Groups[] = {
+    {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, NULL, VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,                0, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR },
+    {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, NULL, VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,                1, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR },
+    {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, NULL, VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,                2, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR },
+    {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR, NULL, VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, VK_SHADER_UNUSED_KHR, 3, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR },
+  };
+
+  // Create the ray tracing pipeline with recursion depth of 2 (primary + shadow rays)
+  VK_CHECK (Context->Raytracing.Create_Pipeline (/*device            =>*/ Context->Device,
+                                                 /*deferredOperation =>*/ VK_NULL_HANDLE,
+                                                 /*pipelineCache     =>*/ VK_NULL_HANDLE,
+                                                 /*createInfoCount   =>*/ 1,
+                                                 /*pCreateInfos      =>*/ &(VkRayTracingPipelineCreateInfoKHR){
+                                                   .sType                        = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
+                                                   .stageCount                   = 4,
+                                                   .pStages                      = Stages,
+                                                   .groupCount                   = 4,
+                                                   .pGroups                      = Groups,
+                                                   .maxPipelineRayRecursionDepth = 2,
+                                                   .layout                       = Context->Pipeline_Layout,
+                                                 },
+                                                 /*pAllocator        =>*/ NULL,
+                                                 /*pPipelines        =>*/ &Context->Pipeline));
+
+  // Destroy the shader modules now that the pipeline owns the compiled code
+  vkDestroyShaderModule (Context->Device, Ray_Generation, NULL);
+  vkDestroyShaderModule (Context->Device, Closest_Hit,    NULL);
+  vkDestroyShaderModule (Context->Device, Primary_Miss,   NULL);
+  vkDestroyShaderModule (Context->Device, Shadow_Miss,    NULL);
+}
+
+/* Build the shader binding table (SBT) by querying shader group handles from the pipeline
+   and laying them out in an aligned buffer.  Each group gets one entry at the required stride. */
+
+void Shader_Binding_Table_Create (Vulkan_Context *Context) {
+  U32 Handle_Size      = Context->Raytracing_Properties.shaderGroupHandleSize;
+  U32 Handle_Alignment = Context->Raytracing_Properties.shaderGroupHandleAlignment;
+  U32 Base_Alignment   = Context->Raytracing_Properties.shaderGroupBaseAlignment;
+
+  // Compute the stride: aligned handle size, at least as large as the base alignment
+  U32 Stride = (Handle_Size + Handle_Alignment - 1) & compl (Handle_Alignment - 1);
+  if (Stride < Base_Alignment) Stride = Base_Alignment;
+
+  // Retrieve the raw shader group handles from the pipeline
+  U32 Group_Count = 4;
+  U8 *Handles = malloc (Handle_Size * Group_Count);
+  VK_CHECK (Context->Raytracing.Get_Shader_Group_Handles (Context->Device, Context->Pipeline, 0, Group_Count, Handle_Size * Group_Count, Handles));
+
+  // Allocate the SBT buffer and copy each handle at the proper stride offset
+  U32 Table_Size = Stride * Group_Count;
+  Context->Shader_Binding_Table_Buffer = Buffer_Allocate (/*Device          =>*/ Context->Device,
+                                                          /*Physical_Device =>*/ Context->Physical_Device,
+                                                          /*Size            =>*/ Table_Size,
+                                                          /*Usage           =>*/ VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                          /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  // Comment here !!!
+  U8 *Destination;
+  vkMapMemory (Context->Device, Context->Shader_Binding_Table_Buffer.Memory, 0, Table_Size, 0, (void **)&Destination);
+  for (U32 Index = 0; Index < Group_Count; Index++)
+    memcpy (Destination + Index * Stride, Handles + Index * Handle_Size, Handle_Size);
+  vkUnmapMemory (Context->Device, Context->Shader_Binding_Table_Buffer.Memory);
+  free (Handles);
+
+  // Set up the strided device address regions for each shader group type
+  VkDeviceAddress Base = Context->Shader_Binding_Table_Buffer.Address;
+  Context->Shader_Binding_Ray_Generation = (VkStridedDeviceAddressRegionKHR){Base + 0 * Stride, Stride, Stride };
+  Context->Shader_Binding_Miss           = (VkStridedDeviceAddressRegionKHR){Base + 1 * Stride, Stride, Stride * 2 };
+  Context->Shader_Binding_Hit            = (VkStridedDeviceAddressRegionKHR){Base + 3 * Stride, Stride, Stride };
+  Context->Shader_Binding_Callable       = (VkStridedDeviceAddressRegionKHR){0 };
+}
+
+/* <<descriptors>> ====================================================================================== */
+
+/* Create the descriptor pool and allocate a single descriptor set, then write all 12 bindings
+   covering the TLAS, storage image, camera uniform, scene buffers, lightmap, weapon buffers,
+   and the variable-count texture array. */
+
+void Descriptor_Set_Create (Vulkan_Context *Context, Weapon_Instance *Weapon) {
+  VkDescriptorPoolSize Pool_Sizes[] = {
+    {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,              1},
+    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,             1},
+    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,             7},
+    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,     257},
+  };
+
+  VK_CHECK (vkCreateDescriptorPool (/*device          =>*/ Context->Device,
+                                    /*pCreateInfo     =>*/ &(VkDescriptorPoolCreateInfo){
+                                      .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                      .maxSets       = 1,
+                                      .poolSizeCount = 5,
+                                      .pPoolSizes    = Pool_Sizes,
+                                    },
+                                    /*pAllocator      =>*/ NULL,
+                                    /*pDescriptorPool =>*/ &Context->Descriptor_Pool));
+
+  // Allocate the descriptor set with a variable descriptor count for the texture array
+  U32 Variable_Count = Context->Texture_Count;
+  VkDescriptorSetVariableDescriptorCountAllocateInfo Variable_Allocate = {
+    .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+    .descriptorSetCount = 1,
+    .pDescriptorCounts  = &Variable_Count,
+  };
+
+  VK_CHECK (vkAllocateDescriptorSets (/*device          =>*/ Context->Device,
+                                      /*pAllocateInfo   =>*/ &(VkDescriptorSetAllocateInfo){
+      .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .pNext              = &Variable_Allocate,
+      .descriptorPool     = Context->Descriptor_Pool,
+      .descriptorSetCount = 1,
+      .pSetLayouts        = &Context->Descriptor_Set_Layout,
+    },
+                                      /*pDescriptorSets =>*/ &Context->Descriptor_Set));
+
+  // Prepare descriptor info structures for each binding
+  VkWriteDescriptorSetAccelerationStructureKHR Acceleration_Write = {
+    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+    .accelerationStructureCount = 1,
+    .pAccelerationStructures    = &Context->Top_Level.Handle,
+  };
+
+  VkDescriptorImageInfo  Image_Info             = {.imageView = Context->Raytracing_Storage_Image.View, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+  VkDescriptorBufferInfo Camera_Info            = {Context->Camera_Uniform_Buffer.Buffer, 0, Context->Camera_Uniform_Buffer.Size };
+  VkDescriptorBufferInfo Vertex_Info            = {Context->Vertex_Buffer.Buffer,         0, Context->Vertex_Buffer.Size };
+  VkDescriptorBufferInfo Index_Info             = {Context->Index_Buffer.Buffer,          0, Context->Index_Buffer.Size };
+  VkDescriptorBufferInfo Material_Info          = {Context->Material_Buffer.Buffer,       0, Context->Material_Buffer.Size };
+  VkDescriptorBufferInfo Texture_Id_Info        = {Context->Texture_Id_Buffer.Buffer,     0, Context->Texture_Id_Buffer.Size };
+  VkDescriptorBufferInfo Weapon_Vertex_Info     = {Weapon->Vertex_Buffer.Buffer,          0, Weapon->Vertex_Buffer.Size };
+  VkDescriptorBufferInfo Weapon_Index_Info      = {Weapon->Index_Buffer.Buffer,           0, Weapon->Index_Buffer.Size };
+  VkDescriptorBufferInfo Weapon_Texture_Id_Info = {Weapon->Texture_Id_Buffer.Buffer,      0, Weapon->Texture_Id_Buffer.Size };
+
+  // Build the texture array descriptor info for all loaded textures
+  VkDescriptorImageInfo *Texture_Infos = calloc (Context->Texture_Count, sizeof (VkDescriptorImageInfo));
+  for (U32 Index = 0; Index < Context->Texture_Count; Index++) {
+    Texture_Infos[Index] = (VkDescriptorImageInfo){
+      .sampler     = Context->Texture_Sampler,
+      .imageView   = Context->Texture_Views[Index],
+      .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+  }
+
+  VkDescriptorImageInfo Lightmap_Info = {
+    .sampler = Context->Lightmap_Sampler, .imageView = Context->Lightmap_View, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+  };
+
+  // Write all 12 descriptor bindings in one batch
+  VkWriteDescriptorSet Writes[] = {
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &Acceleration_Write, Context->Descriptor_Set, 0, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 1,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          &Image_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 2,  0, 1,                       VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         NULL, &Camera_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 3,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Vertex_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 4,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Index_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 5,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Material_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 6,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Texture_Id_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 7,  0, 1,                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &Lightmap_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 8,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Weapon_Vertex_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 9,  0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Weapon_Index_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 10, 0, 1,                       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         NULL, &Weapon_Texture_Id_Info },
+    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, Context->Descriptor_Set, 11, 0, Context->Texture_Count,  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, Texture_Infos },
+  };
+
+  vkUpdateDescriptorSets (Context->Device, 12, Writes, 0, NULL);
+  free (Texture_Infos);
+}
+
+/* <<camera>> =========================================================================================== */
+
+/* Compute inverse view and inverse projection matrices from the camera state, then upload
+   the camera uniform buffer for the ray generation and closest-hit shaders. */
+
+void Camera_Upload (Vulkan_Context *Context, Camera *State, F32 Field_Of_View, U32 Weapon_Texture_Base) {
+  M4 View       = M4_View (State->Position, State->Yaw, State->Pitch);
+  M4 Projection = M4_Perspective (Field_Of_View, (F32)Context->Width / Context->Height, 0.1f, 10000.f);
+
+  struct {
+    M4  Inverse_View, Inverse_Projection;
+    U32 Frame;
+    U32 Weapon_Texture_Base;
+    F32 Padding[2];
+  } Uniform;
+
+  Uniform.Inverse_View        = M4_Inverse_Orthogonal (View);
+  Uniform.Inverse_Projection  = M4_Inverse_Projection (Projection);
+  Uniform.Frame               = State->Frame;
+  Uniform.Weapon_Texture_Base = Weapon_Texture_Base;
+
+  Buffer_Upload (Context->Device, Context->Camera_Uniform_Buffer, &Uniform, sizeof (Uniform));
+}
+
+/* <<weapon>> =========================================================================================== */
+
+/* Update the weapon viewmodel's position, orientation, and animation state.  The weapon follows
+   the camera with an offset, applies recoil and bob animation, and transforms all model vertices
+   from local space to world space using the camera basis and tag_weapon animation frame. */
+
+void Weapon_Update (Weapon_Instance *Weapon, const Camera *Camera_Data, F32 Delta_Time, int Fire) {
+  if (not Weapon->Model.Vertex_Count) return;
+
+  // Advance the fire animation state machine
+  if (Fire and not Weapon->Is_Firing) {
+    Weapon->Is_Firing = 1;
+    Weapon->Fire_Time = 0;
+  }
+  if (Weapon->Is_Firing) {
+    Weapon->Fire_Time += Delta_Time * 10.f;
+    if (Weapon->Fire_Time >= 6.f) {
+      Weapon->Is_Firing = 0;
+      Weapon->Fire_Time = 0;
     }
-    buf_upload(C->dev, tlas_inst_buf, insts,
-               sizeof(VkAccelerationStructureInstanceKHR) * n_inst);
+  }
+  Weapon->Bob_Time += Delta_Time;
 
-    VkAccelerationStructureGeometryKHR geom = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
-        .geometryType=VK_GEOMETRY_TYPE_INSTANCES_KHR,
-        .flags=VK_GEOMETRY_OPAQUE_BIT_KHR,
-        .geometry.instances={
-            .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
-            .arrayOfPointers=VK_FALSE,
-            .data.deviceAddress=tlas_inst_buf.a
-        }
-    };
-    VkAccelerationStructureBuildGeometryInfoKHR bgi = {
-        .sType=VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
-        .type=VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
-        .flags=VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
-        .mode=VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
-        .dstAccelerationStructure=C->tlas.h,
-        .scratchData.deviceAddress=tlas_scratch.a,
-        .geometryCount=1, .pGeometries=&geom
-    };
-    VkAccelerationStructureBuildRangeInfoKHR range = {.primitiveCount=n_inst};
-    const VkAccelerationStructureBuildRangeInfoKHR *p_range = &range;
-    VK(vkResetCommandBuffer(C->cmd, 0));
-    VK(vkBeginCommandBuffer(C->cmd, &(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}));
-    C->rt.CmdBuildAS(C->cmd, 1, &bgi, &p_range);
-    VK(vkEndCommandBuffer(C->cmd));
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd}, VK_NULL_HANDLE));
-    VK(vkQueueWaitIdle(C->q));
-}
+  // Derive the camera's orthonormal basis from yaw and pitch
+  F32 Cosine_Yaw   = cosf (Camera_Data->Yaw);
+  F32 Sine_Yaw     = sinf (Camera_Data->Yaw);
+  F32 Cosine_Pitch = cosf (Camera_Data->Pitch);
+  F32 Sine_Pitch   = sinf (Camera_Data->Pitch);
 
-/* <<pipeline>> ========================================================== */
+  V3 Forward = V3_Make (-Sine_Pitch, Cosine_Pitch, -Cosine_Yaw * Cosine_Pitch);
+  V3 Right   = V3_Normalize (V3_Cross (Forward, V3_Make (0, 1, 0)));
+  V3 Up      = V3_Cross (Right, Forward);
 
-static void pipeline_rt_create(Ctx *C) {
-    VkDescriptorSetLayoutBinding bindings[] = {
-        {0,VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1,VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_RAYGEN_BIT_KHR},
-        {2,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_RAYGEN_BIT_KHR|VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {4,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {5,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {6,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {7,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-        {8,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},  /* wpn verts */
-        {9,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},  /* wpn idxs */
-        {10,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR}, /* wpn tex_ids */
-        {11,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,256,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
-    };
-    VkDescriptorBindingFlags bflags[] = {0,0,0,0,0,0,0,0,0,0,0,
-        VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT|VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT};
-    VkDescriptorSetLayoutBindingFlagsCreateInfo bfci = {
-        .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-        .bindingCount=12, .pBindingFlags=bflags
-    };
-    VK(vkCreateDescriptorSetLayout(C->dev, &(VkDescriptorSetLayoutCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .pNext=&bfci,
-        .bindingCount=12, .pBindings=bindings
-    }, NULL, &C->dsl));
-    VK(vkCreatePipelineLayout(C->dev, &(VkPipelineLayoutCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount=1, .pSetLayouts=&C->dsl
-    }, NULL, &C->pipe_layout));
+  // Compute the viewmodel offset with idle bob and recoil animations
+  F32 Bob_Vertical   = sinf (Weapon->Bob_Time * 3.5f) * 0.4f;
+  F32 Bob_Horizontal = cosf (Weapon->Bob_Time * 1.7f) * 0.2f;
+  F32 Recoil         = Weapon->Is_Firing ? -1.2f * expf (-Weapon->Fire_Time * 5.f) : 0.f;
 
-    VkShaderModule rgen  = shader_load(C->dev, "build/shaders/rgen.spv");
-    VkShaderModule rchit = shader_load(C->dev, "build/shaders/rchit.spv");
-    VkShaderModule rmiss = shader_load(C->dev, "build/shaders/rmiss.spv");
-    VkShaderModule smiss = shader_load(C->dev, "build/shaders/shadow.rmiss.spv");
+  V3 Offset = V3_Add (/*Left  =>*/ Camera_Data->Position,
+                      /*Right =>*/ V3_Add (V3_Scale (Forward, 8.f + Recoil),
+    V3_Add (V3_Scale (Right,   5.f + Bob_Horizontal),
+            V3_Scale (Up,     -5.f + Bob_Vertical))));
 
-    VkPipelineShaderStageCreateInfo stages[] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,NULL,0,VK_SHADER_STAGE_RAYGEN_BIT_KHR,     rgen, "main",NULL},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,NULL,0,VK_SHADER_STAGE_MISS_BIT_KHR,       rmiss,"main",NULL},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,NULL,0,VK_SHADER_STAGE_MISS_BIT_KHR,       smiss,"main",NULL},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,NULL,0,VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,rchit,"main",NULL},
-    };
-    VkRayTracingShaderGroupCreateInfoKHR groups[] = {
-        {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,NULL,
-         VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 0,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR},
-        {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,NULL,
-         VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 1,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR},
-        {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,NULL,
-         VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR, 2,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR},
-        {VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,NULL,
-         VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR, VK_SHADER_UNUSED_KHR,3,VK_SHADER_UNUSED_KHR,VK_SHADER_UNUSED_KHR},
-    };
-    VK(C->rt.CreateRTPipe(C->dev, VK_NULL_HANDLE, VK_NULL_HANDLE, 1,
-        &(VkRayTracingPipelineCreateInfoKHR){
-            .sType=VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR,
-            .stageCount=4, .pStages=stages,
-            .groupCount=4, .pGroups=groups,
-            .maxPipelineRayRecursionDepth=2,
-            .layout=C->pipe_layout
-        }, NULL, &C->pipe));
-
-    vkDestroyShaderModule(C->dev,rgen,NULL);
-    vkDestroyShaderModule(C->dev,rchit,NULL);
-    vkDestroyShaderModule(C->dev,rmiss,NULL);
-    vkDestroyShaderModule(C->dev,smiss,NULL);
-}
-
-static void sbt_create(Ctx *C) {
-    U32 handle_sz    = C->rt_props.shaderGroupHandleSize;
-    U32 handle_align = C->rt_props.shaderGroupHandleAlignment;
-    U32 base_align   = C->rt_props.shaderGroupBaseAlignment;
-    U32 stride       = (handle_sz + handle_align - 1) & ~(handle_align - 1);
-    if (stride < base_align) stride = base_align;
-
-    U32 n_groups = 4;
-    U8 *handles = malloc(handle_sz * n_groups);
-    VK(C->rt.RTHandles(C->dev, C->pipe, 0, n_groups, handle_sz*n_groups, handles));
-
-    U32 sbt_sz = stride * n_groups;
-    C->sbt = buf_alloc(C->dev, C->pd, sbt_sz,
-        VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    U8 *dst; vkMapMemory(C->dev, C->sbt.m, 0, sbt_sz, 0, (void**)&dst);
-    for (U32 i=0;i<n_groups;i++)
-        memcpy(dst + i*stride, handles + i*handle_sz, handle_sz);
-    vkUnmapMemory(C->dev, C->sbt.m);
-    free(handles);
-
-    VkDeviceAddress base = C->sbt.a;
-    C->sbt_rgen = (VkStridedDeviceAddressRegionKHR){base+0*stride, stride, stride};
-    C->sbt_miss = (VkStridedDeviceAddressRegionKHR){base+1*stride, stride, stride*2};
-    C->sbt_hit  = (VkStridedDeviceAddressRegionKHR){base+3*stride, stride, stride};
-    C->sbt_call = (VkStridedDeviceAddressRegionKHR){0};
-}
-
-/* <<descriptors>> ======================================================= */
-
-static void desc_create(Ctx *C, Wpn *wpn) {
-    VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,7}, /* 4 world + 3 weapon */
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,257}, /* 256 textures + 1 lightmap */
-    };
-    VK(vkCreateDescriptorPool(C->dev, &(VkDescriptorPoolCreateInfo){
-        .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets=1, .poolSizeCount=5, .pPoolSizes=sizes
-    }, NULL, &C->dp));
-    U32 var_count = C->n_tex;
-    VkDescriptorSetVariableDescriptorCountAllocateInfo var_alloc = {
-        .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
-        .descriptorSetCount=1, .pDescriptorCounts=&var_count
-    };
-    VK(vkAllocateDescriptorSets(C->dev, &(VkDescriptorSetAllocateInfo){
-        .sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .pNext=&var_alloc,
-        .descriptorPool=C->dp, .descriptorSetCount=1, .pSetLayouts=&C->dsl
-    }, &C->ds));
-
-    VkWriteDescriptorSetAccelerationStructureKHR tlas_write = {
-        .sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
-        .accelerationStructureCount=1, .pAccelerationStructures=&C->tlas.h
-    };
-    VkDescriptorImageInfo img_info = {
-        .imageView=C->rt_img.v, .imageLayout=VK_IMAGE_LAYOUT_GENERAL
-    };
-    VkDescriptorBufferInfo cam_info  = {C->cam_ubo.b, 0, C->cam_ubo.sz};
-    VkDescriptorBufferInfo vtx_info  = {C->vbuf.b,    0, C->vbuf.sz};
-    VkDescriptorBufferInfo idx_info  = {C->ibuf.b,    0, C->ibuf.sz};
-    VkDescriptorBufferInfo mat_info  = {C->mbuf.b,    0, C->mbuf.sz};
-    VkDescriptorBufferInfo tid_info  = {C->tex_id_buf.b, 0, C->tex_id_buf.sz};
-    VkDescriptorBufferInfo wvtx_info = {wpn->vbuf.b,    0, wpn->vbuf.sz};
-    VkDescriptorBufferInfo widx_info = {wpn->ibuf.b,    0, wpn->ibuf.sz};
-    VkDescriptorBufferInfo wtid_info = {wpn->tid_buf.b,  0, wpn->tid_buf.sz};
-
-    VkDescriptorImageInfo *tex_infos = calloc(C->n_tex, sizeof(VkDescriptorImageInfo));
-    for (U32 i = 0; i < C->n_tex; i++) {
-        tex_infos[i] = (VkDescriptorImageInfo){
-            .sampler=C->tex_sampler,
-            .imageView=C->tex_views[i],
-            .imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        };
+  // Select the current animation frame from the hand model's tag_weapon data
+  U32 Frame_Index = 0;
+  if (Weapon->Model.Animation_Frame_Count > 1) {
+    if (Weapon->Is_Firing) {
+      Frame_Index = (U32)Weapon->Fire_Time;
+      if (Frame_Index >= Weapon->Model.Animation_Frame_Count)
+        Frame_Index = Weapon->Model.Animation_Frame_Count - 1;
     }
+  }
 
-    VkDescriptorImageInfo lm_info = {
-        .sampler=C->lm_sampler,
-        .imageView=C->lm_view,
-        .imageLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    };
+  // Read the tag transform (origin + 3x3 axis matrix) for the current animation frame
+  const F32 *Tag = Weapon->Model.Tag_Weapon[Frame_Index];
 
-    VkWriteDescriptorSet writes[] = {
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,&tlas_write,C->ds,0,0,1,VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,1,0,1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,   &img_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,2,0,1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,  NULL,&cam_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,3,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&vtx_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,4,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&idx_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,5,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&mat_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,6,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&tid_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,7,0,1,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,&lm_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,8,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&wvtx_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,9,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,  NULL,&widx_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,10,0,1,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL,&wtid_info},
-        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,NULL,C->ds,11,0,C->n_tex,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,tex_infos},
-    };
-    vkUpdateDescriptorSets(C->dev, 12, writes, 0, NULL);
-    free(tex_infos);
+  // Swizzle each tag axis from Quake 3 Z-up to Y-up: (x,y,z) becomes (x,z,-y)
+  V3 Axis_0 = (V3){Tag[3],  Tag[5],  -Tag[4]  };
+  V3 Axis_1 = (V3){Tag[6],  Tag[8],  -Tag[7]  };
+  V3 Axis_2 = (V3){Tag[9],  Tag[11], -Tag[10] };
+
+  // Build the Y-up tag rotation matrix: columns = [forward | up | -left]
+  F32 Tag_Y_Up[9] = {
+    Axis_0.x, Axis_2.x, -Axis_1.x,
+    Axis_0.y, Axis_2.y, -Axis_1.y,
+    Axis_0.z, Axis_2.z, -Axis_1.z,
+  };
+
+  // Camera basis matrix (row-major): columns = forward, up, right
+  F32 Camera_Basis[9] = {
+    Forward.x, Up.x, Right.x,
+    Forward.y, Up.y, Right.y,
+    Forward.z, Up.z, Right.z,
+  };
+
+  // Combined rotation = Camera_Basis * Tag_Y_Up
+  F32 Rotation[9];
+  for (int Row = 0; Row < 3; Row++)
+    for (int Column = 0; Column < 3; Column++)
+      Rotation[Row * 3 + Column] = Camera_Basis[Row * 3 + 0] * Tag_Y_Up[0 * 3 + Column]
+                                 + Camera_Basis[Row * 3 + 1] * Tag_Y_Up[1 * 3 + Column]
+                                 + Camera_Basis[Row * 3 + 2] * Tag_Y_Up[2 * 3 + Column];
+
+  // Scale the viewmodel down slightly for a better first-person perspective feel
+  F32 Scale = 0.7f;
+
+  // Transform each vertex from model space to world space
+  for (U32 Index = 0; Index < Weapon->Model.Vertex_Count; Index++) {
+    F32 Source_X = Weapon->Model.Vertices[Index].Position[0] * Scale;
+    F32 Source_Y = Weapon->Model.Vertices[Index].Position[1] * Scale;
+    F32 Source_Z = Weapon->Model.Vertices[Index].Position[2] * Scale;
+
+    // Apply the combined rotation and translate by the camera offset
+    Weapon->Transformed_Vertices[Index].Position[0] = Rotation[0] * Source_X + Rotation[1] * Source_Y + Rotation[2] * Source_Z + Offset.x;
+    Weapon->Transformed_Vertices[Index].Position[1] = Rotation[3] * Source_X + Rotation[4] * Source_Y + Rotation[5] * Source_Z + Offset.y;
+    Weapon->Transformed_Vertices[Index].Position[2] = Rotation[6] * Source_X + Rotation[7] * Source_Y + Rotation[8] * Source_Z + Offset.z;
+
+    // Rotate normals by the same matrix (no translation for normals)
+    F32 Normal_X = Weapon->Model.Vertices[Index].Normal[0];
+    F32 Normal_Y = Weapon->Model.Vertices[Index].Normal[1];
+    F32 Normal_Z = Weapon->Model.Vertices[Index].Normal[2];
+
+      // Rotate the vertex normal by the same 3x3 rotation matrix
+    Weapon->Transformed_Vertices[Index].Normal[0] = Rotation[0] * Normal_X + Rotation[1] * Normal_Y + Rotation[2] * Normal_Z;
+    Weapon->Transformed_Vertices[Index].Normal[1] = Rotation[3] * Normal_X + Rotation[4] * Normal_Y + Rotation[5] * Normal_Z;
+    Weapon->Transformed_Vertices[Index].Normal[2] = Rotation[6] * Normal_X + Rotation[7] * Normal_Y + Rotation[8] * Normal_Z;
+
+    // Pass texture coordinates through unchanged
+    Weapon->Transformed_Vertices[Index].Texture_Uv[0] = Weapon->Model.Vertices[Index].Texture_Uv[0];
+    Weapon->Transformed_Vertices[Index].Texture_Uv[1] = Weapon->Model.Vertices[Index].Texture_Uv[1];
+  }
 }
 
-/* <<camera>> ============================================================ */
+/* <<input>> ============================================================================================ */
 
-static void cam_upload(Ctx *C, Cam *cam, F32 fov, U32 wpn_tex_base) {
-    M4 view = m4view(cam->pos, cam->yaw, cam->pitch);
-    M4 proj = m4persp(fov, (F32)C->W / C->H, 0.1f, 10000.f);
-    struct { M4 inv_v, inv_p; U32 frame; U32 wpn_tex_base; F32 pad[2]; } ubo;
-    ubo.inv_v = m4inv_ortho(view);
-    ubo.inv_p = m4inv_proj(proj);
-    ubo.frame = cam->frame;
-    ubo.wpn_tex_base = wpn_tex_base;
-    buf_upload(C->dev, C->cam_ubo, &ubo, sizeof(ubo));
+/* Poll SDL events and keyboard state to produce a frame's worth of input.
+   Mouse motion is accumulated from all events; keyboard state is sampled once. */
+
+Input Poll_Input (Vulkan_Context *Context) {
+  Input Input_Data = {0};
+  SDL_Event Event;
+
+  // Process all pending SDL events: quit, escape, mouse motion, and mouse clicks
+  while (SDL_PollEvent (&Event)) {
+    if (Event.type == SDL_QUIT) Context->Quit = 1;
+    if (Event.type == SDL_KEYDOWN and Event.key.keysym.sym == SDLK_ESCAPE) Context->Quit = 1;
+    if (Event.type == SDL_MOUSEMOTION) {
+      Input_Data.Delta_X += Event.motion.xrel;
+      Input_Data.Delta_Y += Event.motion.yrel;
+    }
+    if (Event.type == SDL_MOUSEBUTTONDOWN and Event.button.button == SDL_BUTTON_LEFT)
+      Input_Data.Fire = 1;
+  }
+
+  // Sample the current keyboard state for movement keys
+  const U8 *Keyboard = SDL_GetKeyboardState (NULL);
+  Input_Data.Forward = Keyboard[SDL_SCANCODE_W]     or Keyboard[SDL_SCANCODE_UP];
+  Input_Data.Back    = Keyboard[SDL_SCANCODE_S]     or Keyboard[SDL_SCANCODE_DOWN];
+  Input_Data.Left    = Keyboard[SDL_SCANCODE_A]     or Keyboard[SDL_SCANCODE_LEFT];
+  Input_Data.Right   = Keyboard[SDL_SCANCODE_D]     or Keyboard[SDL_SCANCODE_RIGHT];
+  Input_Data.Jump    = Keyboard[SDL_SCANCODE_SPACE];
+  Input_Data.Crouch  = Keyboard[SDL_SCANCODE_LCTRL] or Keyboard[SDL_SCANCODE_C];
+  return Input_Data;
 }
 
-/* <<weapon>> ============================================================ */
+/* <<render>> =========================================================================================== */
 
-static void wpn_update(Wpn *w, const Cam *cam, F32 dt, int fire) {
-    if (!w->mdl.nv) return;
+/* Execute one frame of ray tracing: wait for the previous frame to finish, acquire a swapchain
+   image, dispatch rays, blit the storage image to the swapchain image, and present. */
 
-    /* fire state machine */
-    if (fire && !w->firing) { w->firing = 1; w->fire_t = 0; }
-    if (w->firing) {
-        w->fire_t += dt * 10.f; /* ~10 fps animation */
-        if (w->fire_t >= 6.f) { w->firing = 0; w->fire_t = 0; }
-    }
-    w->bob_t += dt;
+void Raytracing_Frame (Vulkan_Context *Context) {
 
-    /* camera basis */
-    F32 cy=cosf(cam->yaw), sy=sinf(cam->yaw);
-    F32 cp=cosf(cam->pitch), sp=sinf(cam->pitch);
-    V3 fwd   = v3(sy*cp, -sp, -cy*cp);
-    V3 right = v3norm(v3cross(fwd, v3(0,1,0)));
-    V3 up    = v3cross(right, fwd);
+  // Wait for the previous frame's GPU work to complete
+  VK_CHECK (vkWaitForFences (Context->Device, 1, &Context->Fence, VK_TRUE, UINT64_MAX));
 
-    /* viewmodel offset from camera */
-    F32 bob_v = sinf(w->bob_t * 3.5f) * 0.4f;
-    F32 bob_h = cosf(w->bob_t * 1.7f) * 0.2f;
-    F32 recoil = w->firing ? -1.2f * expf(-w->fire_t * 5.f) : 0.f;
+  // Acquire the next swapchain image
+  U32 Image_Index;
+  VK_CHECK (vkAcquireNextImageKHR (/*device      =>*/ Context->Device,
+                                   /*swapchain   =>*/ Context->Swapchain,
+                                   /*timeout     =>*/ UINT64_MAX,
+                                   /*semaphore   =>*/ Context->Semaphore_Image_Available,
+                                   /*fence       =>*/ VK_NULL_HANDLE,
+                                   /*pImageIndex =>*/ &Image_Index));
 
-    V3 offset = v3add(cam->pos,
-                v3add(v3scale(fwd, 8.f + recoil),
-                v3add(v3scale(right, 5.f + bob_h),
-                      v3scale(up, -5.f + bob_v))));
+  // Reset the fence and begin recording the frame's command buffer
+  VK_CHECK (vkResetFences (Context->Device, 1, &Context->Fence));
+  VK_CHECK (vkResetCommandBuffer (Context->Command_Buffer, 0));
+  VK_CHECK (vkBeginCommandBuffer (/*commandBuffer =>*/ Context->Command_Buffer,
+                                  /*pBeginInfo    =>*/ &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }));
 
-    /* interpolate tag_weapon animation frame */
-    U32 fr = 0;
-    if (w->mdl.n_anim_frames > 1) {
-        if (w->firing) {
-            fr = (U32)w->fire_t;
-            if (fr >= w->mdl.n_anim_frames) fr = w->mdl.n_anim_frames - 1;
-        }
-    }
-    const F32 *tag = w->mdl.tag_wpn[fr]; /* origin(3) + axis(9) */
+  // Bind the ray tracing pipeline and descriptor set
+  vkCmdBindPipeline (Context->Command_Buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, Context->Pipeline);
+  vkCmdBindDescriptorSets (/*commandBuffer      =>*/ Context->Command_Buffer,
+                           /*pipelineBindPoint  =>*/ VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+                           /*layout             =>*/ Context->Pipeline_Layout,
+                           /*firstSet           =>*/ 0,
+                           /*descriptorSetCount =>*/ 1,
+                           /*pDescriptorSets    =>*/ &Context->Descriptor_Set,
+                           /*dynamicOffsetCount =>*/ 0,
+                           /*pDynamicOffsets    =>*/ NULL);
 
-    /* build weapon-to-world rotation: camera_basis * tag_rot_yup * model_vert
-       Model verts are Y-up swizzled: X=barrel, Y=up, Z=right.
-       Tag axis vectors are Q3 Z-up, need swizzle (x,y,z)→(x,z,-y).
-       Camera basis maps model axes to world: X→fwd, Y→up, Z→right.
-       Tag rotation in Y-up: T_yup = S * T_q3 * S^(-1) where S is the swizzle.
-       Combined: R = CamBasis * T_yup, both row-major. */
-    F32 R[9];
+  // Dispatch ray tracing for every pixel
+  Context->Raytracing.Command_Trace_Rays (/*commandBuffer =>*/ Context->Command_Buffer,
+                                          /*pRaygenSBT    =>*/ &Context->Shader_Binding_Ray_Generation,
+                                          /*pMissSBT      =>*/ &Context->Shader_Binding_Miss,
+                                          /*pHitSBT       =>*/ &Context->Shader_Binding_Hit,
+                                          /*pCallableSBT  =>*/ &Context->Shader_Binding_Callable,
+                                          /*width         =>*/ Context->Width,
+                                          /*height        =>*/ Context->Height,
+                                          /*depth         =>*/ 1);
 
-    /* swizzle each tag axis to Y-up: (x,y,z)→(x,z,-y) */
-    V3 a0 = {tag[3], tag[5], -tag[4]};   /* tag forward (swizzled) */
-    V3 a1 = {tag[6], tag[8], -tag[7]};   /* tag left    (swizzled) */
-    V3 a2 = {tag[9], tag[11], -tag[10]}; /* tag up      (swizzled) */
+  // Transition the storage image from general to transfer-source for the blit
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Context->Command_Buffer,
+                        /*Image              =>*/ Context->Raytracing_Storage_Image.Image,
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_GENERAL,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        /*Source_Access      =>*/ VK_ACCESS_SHADER_WRITE_BIT,
+                        /*Destination_Access =>*/ VK_ACCESS_TRANSFER_READ_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    /* T_yup maps Y-up model coords to Y-up tag space:
-       v_tag = a0*v_q3.x + a1*v_q3.y + a2*v_q3.z
-       where v_q3.x = v_yup.x, v_q3.y = -v_yup.z, v_q3.z = v_yup.y
-       → v_tag = a0*v_yup.x + a2*v_yup.y + (-a1)*v_yup.z
-       So T_yup columns = [a0 | a2 | -a1] */
-    F32 TY[9] = { a0.x, a2.x, -a1.x,
-                   a0.y, a2.y, -a1.y,
-                   a0.z, a2.z, -a1.z };
+  // Transition the swapchain image from undefined to transfer-destination
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Context->Command_Buffer,
+                        /*Image              =>*/ Context->Swapchain_Images[Image_Index],
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_UNDEFINED,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        /*Source_Access      =>*/ 0,
+                        /*Destination_Access =>*/ VK_ACCESS_TRANSFER_WRITE_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    /* camera basis (row-major): columns = fwd, up, right
-       maps Y-up model space (X=fwd, Y=up, Z=right) to world */
-    F32 CB[9] = { fwd.x, up.x, right.x,
-                   fwd.y, up.y, right.y,
-                   fwd.z, up.z, right.z };
+  // Blit the ray tracing result to the swapchain image (with potential scaling)
+  vkCmdBlitImage (/*commandBuffer  =>*/ Context->Command_Buffer,
+                  /*srcImage       =>*/ Context->Raytracing_Storage_Image.Image,
+                  /*srcImageLayout =>*/ VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  /*dstImage       =>*/ Context->Swapchain_Images[Image_Index],
+                  /*dstImageLayout =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  /*regionCount    =>*/ 1,
+                  /*pRegions       =>*/ &(VkImageBlit){
+                    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .srcOffsets[1]  = {Context->Width, Context->Height, 1},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .dstOffsets[1]  = {(int)Context->Swapchain_Extent.width, (int)Context->Swapchain_Extent.height, 1},
+                  },
+                  /*filter         =>*/ VK_FILTER_LINEAR);
 
-    /* R = CB * TY */
-    for (int i=0;i<3;i++) for (int j=0;j<3;j++) {
-        R[i*3+j] = CB[i*3+0]*TY[0*3+j] + CB[i*3+1]*TY[1*3+j] + CB[i*3+2]*TY[2*3+j];
-    }
+  // Transition the storage image back to general for the next frame's writes
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Context->Command_Buffer,
+                        /*Image              =>*/ Context->Raytracing_Storage_Image.Image,
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_GENERAL,
+                        /*Source_Access      =>*/ VK_ACCESS_TRANSFER_READ_BIT,
+                        /*Destination_Access =>*/ VK_ACCESS_SHADER_WRITE_BIT,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
 
-    /* scale viewmodel down slightly for better FPS feel */
-    F32 sc = 0.7f;
+  // Transition the swapchain image to present-source for presentation
+  Image_Layout_Barrier (/*Command_Buffer     =>*/ Context->Command_Buffer,
+                        /*Image              =>*/ Context->Swapchain_Images[Image_Index],
+                        /*Old_Layout         =>*/ VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        /*New_Layout         =>*/ VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        /*Source_Access      =>*/ VK_ACCESS_TRANSFER_WRITE_BIT,
+                        /*Destination_Access =>*/ 0,
+                        /*Source_Stage       =>*/ VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        /*Destination_Stage  =>*/ VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
-    /* transform each vertex */
-    for (U32 i = 0; i < w->mdl.nv; i++) {
-        F32 px = w->mdl.verts[i].pos[0] * sc;
-        F32 py = w->mdl.verts[i].pos[1] * sc;
-        F32 pz = w->mdl.verts[i].pos[2] * sc;
-        w->xverts[i].pos[0] = R[0]*px + R[1]*py + R[2]*pz + offset.x;
-        w->xverts[i].pos[1] = R[3]*px + R[4]*py + R[5]*pz + offset.y;
-        w->xverts[i].pos[2] = R[6]*px + R[7]*py + R[8]*pz + offset.z;
-        /* transform normals */
-        F32 nx = w->mdl.verts[i].n[0], ny = w->mdl.verts[i].n[1], nz = w->mdl.verts[i].n[2];
-        w->xverts[i].n[0] = R[0]*nx + R[1]*ny + R[2]*nz;
-        w->xverts[i].n[1] = R[3]*nx + R[4]*ny + R[5]*nz;
-        w->xverts[i].n[2] = R[6]*nx + R[7]*ny + R[8]*nz;
-        /* copy UVs through */
-        w->xverts[i].uv[0] = w->mdl.verts[i].uv[0];
-        w->xverts[i].uv[1] = w->mdl.verts[i].uv[1];
-    }
-}
+  VK_CHECK (vkEndCommandBuffer (Context->Command_Buffer));
 
-/* <<input>> ============================================================= */
+  // Submit the command buffer, waiting on image-available and signaling render-finished
+  VkPipelineStageFlags Wait_Stage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+  VK_CHECK (vkQueueSubmit (/*queue       =>*/ Context->Queue,
+                           /*submitCount =>*/ 1,
+                           /*pSubmits    =>*/ &(VkSubmitInfo){
+                             .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                             .waitSemaphoreCount   = 1,
+                             .pWaitSemaphores      = &Context->Semaphore_Image_Available,
+                             .pWaitDstStageMask    = &Wait_Stage,
+                             .commandBufferCount   = 1,
+                             .pCommandBuffers      = &Context->Command_Buffer,
+                             .signalSemaphoreCount = 1,
+                             .pSignalSemaphores    = &Context->Semaphore_Render_Finished,
+                           },
+                           /*fence       =>*/ Context->Fence));
 
-static Input poll_input(Ctx *C) {
-    Input in = {0};
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type==SDL_QUIT) C->quit=1;
-        if (e.type==SDL_KEYDOWN && e.key.keysym.sym==SDLK_ESCAPE) C->quit=1;
-        if (e.type==SDL_MOUSEMOTION) {
-            in.dx += e.motion.xrel;
-            in.dy += e.motion.yrel;
-        }
-        if (e.type==SDL_MOUSEBUTTONDOWN && e.button.button==SDL_BUTTON_LEFT)
-            in.fire = 1;
-    }
-    const U8 *k = SDL_GetKeyboardState(NULL);
-    in.fwd   = k[SDL_SCANCODE_W]||k[SDL_SCANCODE_UP];
-    in.back  = k[SDL_SCANCODE_S]||k[SDL_SCANCODE_DOWN];
-    in.left  = k[SDL_SCANCODE_A]||k[SDL_SCANCODE_LEFT];
-    in.right = k[SDL_SCANCODE_D]||k[SDL_SCANCODE_RIGHT];
-    in.jump  = k[SDL_SCANCODE_SPACE];
-    in.crouch = k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_C];
-    return in;
-}
-
-/* <<render>> ============================================================ */
-
-static void rt_frame(Ctx *C) {
-    VK(vkWaitForFences(C->dev,1,&C->fence,VK_TRUE,UINT64_MAX));
-    U32 img_idx;
-    VK(vkAcquireNextImageKHR(C->dev,C->sc,UINT64_MAX,C->sem_img,VK_NULL_HANDLE,&img_idx));
-    VK(vkResetFences(C->dev,1,&C->fence));
-    VK(vkResetCommandBuffer(C->cmd,0));
-    VK(vkBeginCommandBuffer(C->cmd,&(VkCommandBufferBeginInfo){
-        .sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
-
-    vkCmdBindPipeline(C->cmd,VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,C->pipe);
-    vkCmdBindDescriptorSets(C->cmd,VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-        C->pipe_layout,0,1,&C->ds,0,NULL);
-
-    C->rt.CmdTrace(C->cmd,
-        &C->sbt_rgen, &C->sbt_miss, &C->sbt_hit, &C->sbt_call,
-        C->W, C->H, 1);
-
-    img_barrier(C->cmd, C->rt_img.i,
-        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    img_barrier(C->cmd, C->sc_img[img_idx],
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    vkCmdBlitImage(C->cmd,
-        C->rt_img.i, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        C->sc_img[img_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &(VkImageBlit){
-            .srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
-            .srcOffsets[1]={C->W,C->H,1},
-            .dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
-            .dstOffsets[1]={(int)C->sc_ext.width,(int)C->sc_ext.height,1}
-        }, VK_FILTER_LINEAR);
-
-    img_barrier(C->cmd, C->rt_img.i,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-    img_barrier(C->cmd, C->sc_img[img_idx],
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-
-    VK(vkEndCommandBuffer(C->cmd));
-
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-    VK(vkQueueSubmit(C->q, 1, &(VkSubmitInfo){
-        .sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount=1, .pWaitSemaphores=&C->sem_img,
-        .pWaitDstStageMask=&wait_stage,
-        .commandBufferCount=1, .pCommandBuffers=&C->cmd,
-        .signalSemaphoreCount=1, .pSignalSemaphores=&C->sem_done
-    }, C->fence));
-
-    VK(vkQueuePresentKHR(C->q, &(VkPresentInfoKHR){
-        .sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .waitSemaphoreCount=1, .pWaitSemaphores=&C->sem_done,
-        .swapchainCount=1, .pSwapchains=&C->sc, .pImageIndices=&img_idx
+  // Present the rendered image to the display
+  VK_CHECK (vkQueuePresentKHR (/*queue        =>*/ Context->Queue,
+                               /*pPresentInfo =>*/ &(VkPresentInfoKHR){
+      .sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+      .waitSemaphoreCount = 1,
+      .pWaitSemaphores    = &Context->Semaphore_Render_Finished,
+      .swapchainCount     = 1,
+      .pSwapchains        = &Context->Swapchain,
+      .pImageIndices      = &Image_Index,
     }));
-    vkQueueWaitIdle(C->q);
+
+  vkQueueWaitIdle (Context->Queue);
 }
 
-/* <<validate>> ========================================================== */
+/* <<validate>> ========================================================================================= */
 
-static void export_validate_json(const Ctx *C, const Scene *S, const char *map) {
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(C->pd, &props);
+/* Write a JSON file summarizing the current renderer state for automated validation.
+   Includes device info, scene statistics, and render configuration. */
 
-    FILE *f = fopen("build/validate.json","w");
-    fprintf(f,"{\n");
-    fprintf(f,"  \"stage\": 3,\n");
-    fprintf(f,"  \"map\": \"%s\",\n", map ? map : "test");
-    fprintf(f,"  \"device\": \"%s\",\n", props.deviceName);
-    fprintf(f,"  \"rt_handle_size\": %u,\n", C->rt_props.shaderGroupHandleSize);
-    fprintf(f,"  \"rt_max_recursion\": %u,\n", C->rt_props.maxRayRecursionDepth);
-    fprintf(f,"  \"scene\": {\n");
-    fprintf(f,"    \"verts\": %u,\n", S->nv);
-    fprintf(f,"    \"tris\": %u,\n",  S->tri_count);
-    fprintf(f,"    \"mats\": %u,\n",  S->nm);
-    fprintf(f,"    \"textures_loaded\": %u,\n", C->n_tex_loaded);
-    fprintf(f,"    \"textures_fallback\": %u\n", C->n_tex - C->n_tex_loaded);
-    fprintf(f,"  },\n");
-    fprintf(f,"  \"render\": {\n");
-    fprintf(f,"    \"width\": %d,\n", C->W);
-    fprintf(f,"    \"height\": %d,\n", C->H);
-    fprintf(f,"    \"sc_images\": %u\n", C->sc_n);
-    fprintf(f,"  }\n");
-    fprintf(f,"}\n");
-    fclose(f);
-    printf("[validate] build/validate.json written\n");
+void Export_Validate_JSON (const Vulkan_Context *Context, const Scene *Scene_Data, const char *Map_Name) {
+  VkPhysicalDeviceProperties Device_Properties;
+  vkGetPhysicalDeviceProperties (Context->Physical_Device, &Device_Properties);
+
+  FILE *File = fopen ("build/validate.json", "w");
+  fprintf (File, "{\n");
+  fprintf (File, "  \"stage\": 3,\n");
+  fprintf (File, "  \"map\": \"%s\",\n",         Map_Name ? Map_Name : "test");
+  fprintf (File, "  \"device\": \"%s\",\n",      Device_Properties.deviceName);
+  fprintf (File, "  \"rt_handle_size\": %u,\n",  Context->Raytracing_Properties.shaderGroupHandleSize);
+  fprintf (File, "  \"rt_max_recursion\": %u,\n", Context->Raytracing_Properties.maxRayRecursionDepth);
+  fprintf (File, "  \"scene\": {\n");
+  fprintf (File, "    \"verts\": %u,\n",          Scene_Data->Vertex_Count);
+  fprintf (File, "    \"tris\": %u,\n",           Scene_Data->Triangle_Count);
+  fprintf (File, "    \"mats\": %u,\n",           Scene_Data->Material_Count);
+  fprintf (File, "    \"textures_loaded\": %u,\n", Context->Textures_Loaded);
+  fprintf (File, "    \"textures_fallback\": %u\n", Context->Texture_Count - Context->Textures_Loaded);
+  fprintf (File, "  },\n");
+  fprintf (File, "  \"render\": {\n");
+  fprintf (File, "    \"width\": %d,\n",          Context->Width);
+  fprintf (File, "    \"height\": %d,\n",         Context->Height);
+  fprintf (File, "    \"sc_images\": %u\n",       Context->Swapchain_Image_Count);
+  fprintf (File, "  }\n");
+  fprintf (File, "}\n");
+  fclose (File);
+  printf ("[validate] build/validate.json written\n");
 }
 
-/* <<main>> ============================================================== */
+/* <<main>> ============================================================================================= */
 
-int main(int argc, char **argv) {
-    const char *map = argc > 1 ? argv[1] : NULL;
-    const int W=1280, H=720;
+int main (int Argument_Count, char **Arguments) {
 
-    SDL_Init(SDL_INIT_VIDEO);
-    Ctx C = {.W=W,.H=H};
-    C.win = SDL_CreateWindow("Quake3 RT",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, W, H,
-        SDL_WINDOW_VULKAN|SDL_WINDOW_SHOWN);
+  // Parse command-line arguments and configure window dimensions
+  const char *Map_Path      = Argument_Count > 1 ? Arguments[1] : NULL;
+  const int   Window_Width  = 1280;
+  const int   Window_Height = 720;
 
-    vk_create_instance(&C);
-    vk_pick_device(&C);
-    vk_create_device(&C);
-    vk_create_swapchain(&C);
-    vk_create_sync(&C);
+  // Initialize the SDL video subsystem
+  SDL_Init (SDL_INIT_VIDEO);
 
-    C.rt_img  = img_storage(C.dev, C.pd, W, H);
-    C.cam_ubo = buf_alloc(C.dev, C.pd, 144,
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  // Initialize the Vulkan context and create the window
+  Vulkan_Context Context = {.Width = Window_Width, .Height = Window_Height };
 
-    vk_transition_storage_image(&C);
+  Context.Window = SDL_CreateWindow (/*title =>*/ "Quake3 RT",
+                                     /*x     =>*/ SDL_WINDOWPOS_CENTERED,
+                                     /*y     =>*/ SDL_WINDOWPOS_CENTERED,
+                                     /*w     =>*/ Window_Width,
+                                     /*h     =>*/ Window_Height,
+                                     /*flags =>*/ SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN);
 
-    Spawn spawn = {.origin={0,2,8}, .angle=0};
-    ColMap col = {0};
-    Scene sc  = map ? scene_load_bsp(map, &spawn, &col) : scene_build_test();
-    textures_load(&C, &sc);
+  // Set up the Vulkan instance, device, swapchain, and synchronization primitives
+  Vulkan_Create_Instance        (&Context);
+  Vulkan_Pick_Physical_Device   (&Context);
+  Vulkan_Create_Logical_Device  (&Context);
+  Vulkan_Create_Swapchain       (&Context);
+  Vulkan_Create_Synchronization (&Context);
 
-    /* load weapon model + textures */
-    Wpn wpn = {0};
-    wpn.mdl = weapon_load();
-    if (wpn.mdl.nv) {
-        wpn_textures_load(&C, &wpn);
-        wpn_blas_init(&C, &wpn);
-    } else {
-        /* create tiny dummy buffers so descriptor bindings 8-10 are valid */
-        Vtx dummy_v = {0}; U32 dummy_i[3] = {0,0,0}; U32 dummy_t = 0;
-        wpn.vbuf = buf_alloc(C.dev, C.pd, sizeof(Vtx),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        buf_upload(C.dev, wpn.vbuf, &dummy_v, sizeof(dummy_v));
-        wpn.ibuf = buf_stage_upload(C.dev, C.pd, C.cmd, C.q,
-            dummy_i, sizeof(dummy_i), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        wpn.tid_buf = buf_stage_upload(C.dev, C.pd, C.cmd, C.q,
-            &dummy_t, sizeof(dummy_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  // Create the ray tracing storage image and camera uniform buffer
+  Context.Raytracing_Storage_Image = Image_Storage_Create (Context.Device, Context.Physical_Device, Window_Width, Window_Height);
+  Context.Camera_Uniform_Buffer    = Buffer_Allocate (/*Device          =>*/ Context.Device,
+                                                      /*Physical_Device =>*/ Context.Physical_Device,
+                                                      /*Size            =>*/ 144,
+                                                      /*Usage           =>*/ VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                      /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+  // Transition the storage image to general layout for ray tracing writes
+  Vulkan_Transition_Storage_Image (&Context);
+
+  // Load the scene from a BSP file or build the test scene
+  Spawn Spawn_Point   = {.Origin = {0, 2, 8}, .Angle = 0 };
+  Collision_Map Collision = {0};
+
+  // Select the BSP or test scene based on whether a map path was provided
+  Scene Scene_Data = Map_Path
+    ? Scene_Load_From_Bsp (Map_Path, &Spawn_Point, &Collision)
+    : Scene_Build_Test ();
+
+  // Upload all scene textures to the GPU (TGA files or solid-color fallbacks)
+  Scene_Load_Textures (&Context, &Scene_Data);
+
+  // Load the weapon model and its textures
+  Weapon_Instance Weapon_Data = {0};
+  Weapon_Data.Model = Weapon_Model_Load ();
+
+  // If the weapon loaded, upload its textures and build its BLAS
+  if (Weapon_Data.Model.Vertex_Count) {
+    Weapon_Load_Textures (&Context, &Weapon_Data);
+    Weapon_Bottom_Level_Initialize (&Context, &Weapon_Data);
+
+  // Otherwise, create minimal dummy buffers so descriptor bindings 8-10 remain valid
+  } else {
+    Vertex Dummy_Vertex     = {0};
+    U32    Dummy_Indices[3] = {0, 0, 0};
+    U32    Dummy_Texture_Id = 0;
+
+    // Create a single-vertex dummy buffer for the weapon vertex binding
+    Weapon_Data.Vertex_Buffer = Buffer_Allocate (/*Device          =>*/ Context.Device,
+                                                 /*Physical_Device =>*/ Context.Physical_Device,
+                                                 /*Size            =>*/ sizeof (Vertex),
+                                                 /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                 /*Memory_Flags    =>*/ VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    Buffer_Upload (Context.Device, Weapon_Data.Vertex_Buffer, &Dummy_Vertex, sizeof (Dummy_Vertex));
+
+    // Create dummy index and texture-id buffers with a single degenerate triangle
+    Weapon_Data.Index_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context.Device,
+                                                    /*Physical_Device =>*/ Context.Physical_Device,
+                                                    /*Command_Buffer  =>*/ Context.Command_Buffer,
+                                                    /*Queue           =>*/ Context.Queue,
+                                                    /*Data            =>*/ Dummy_Indices,
+                                                    /*Size            =>*/ sizeof (Dummy_Indices),
+                                                    /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+    Weapon_Data.Texture_Id_Buffer = Buffer_Stage_Upload (/*Device          =>*/ Context.Device,
+                                                         /*Physical_Device =>*/ Context.Physical_Device,
+                                                         /*Command_Buffer  =>*/ Context.Command_Buffer,
+                                                         /*Queue           =>*/ Context.Queue,
+                                                         /*Data            =>*/ &Dummy_Texture_Id,
+                                                         /*Size            =>*/ sizeof (Dummy_Texture_Id),
+                                                         /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+  }
+
+  // Build the world BLAS and initialize the TLAS with up to 2 instances (world + weapon)
+  Context.Bottom_Level = Build_World_Bottom_Level (&Context, &Scene_Data);
+  Top_Level_Initialize (&Context, 2);
+  Top_Level_Rebuild (/*Context =>*/ &Context,
+                     /*World   =>*/ &Context.Bottom_Level,
+                     /*Weapon  =>*/ Weapon_Data.Model.Vertex_Count ? &Weapon_Data.Bottom_Level : NULL);
+
+  // Create the ray tracing pipeline, shader binding table, and descriptor set
+  Raytracing_Pipeline_Create    (&Context);
+  Shader_Binding_Table_Create   (&Context);
+  Descriptor_Set_Create         (&Context, &Weapon_Data);
+
+  // Write validation data for automated testing
+  Export_Validate_JSON (&Context, &Scene_Data, Map_Path);
+
+  // Initialize the player state at the default view height
+  Player Player_Data     = {0};
+  Player_Data.View_Height = DEFAULT_VIEW_HEIGHT;
+
+  // Set up camera-Y smoothing state (absorbs stair steps and crouch transitions)
+  F32 Smoothed_Camera_Y    = 0;
+  int Camera_Y_Initialized = 0;
+
+  // Place the player at the BSP spawn point if a map was loaded
+  if (Map_Path) {
+
+    // Convert the BSP spawn angle to a yaw in radians
+    Player_Data.Yaw = (90.f - Spawn_Point.Angle) * (F32)M_PI / 180.f;
+
+    // Place the player at the spawn point, nudging upward if embedded in solid
+    V3 Standing_Maximums = V3_Make (15, 32, 15);
+    Player_Data.Position = Spawn_Point.Origin;
+
+    // Nudge the player upward until they escape solid geometry (up to 128 attempts)
+    for (int Iteration = 0; Iteration < 128; Iteration++) {
+      Trace_Result Result = Collision_Trace (/*Start       =>*/ Player_Data.Position,
+                                             /*End         =>*/ Player_Data.Position,
+                                             /*Minimums    =>*/ PLAYER_MINIMUMS,
+                                             /*Maximums    =>*/ Standing_Maximums,
+                                             /*Collision   =>*/ &Collision,
+                                             /*Use_Capsule =>*/ 1);
+      if (not Result.All_Solid) break;
+      Player_Data.Position.y += 1.f;
     }
 
-    C.blas = blas_build(&C, &sc);
+    // Drop the player to the floor from the valid position
+    V3 Down_Point = V3_Add (Player_Data.Position, V3_Make (0, -256, 0));
+    Trace_Result Drop_Result = Collision_Trace (/*Start       =>*/ Player_Data.Position,
+                                                /*End         =>*/ Down_Point,
+                                                /*Minimums    =>*/ PLAYER_MINIMUMS,
+                                                /*Maximums    =>*/ Standing_Maximums,
+                                                /*Collision   =>*/ &Collision,
+                                                /*Use_Capsule =>*/ 1);
+    if (Drop_Result.Fraction < 1.f and not Drop_Result.All_Solid)
+      Player_Data.Position = Drop_Result.End_Position;
 
-    /* preallocate TLAS for 2 instances and do initial build */
-    tlas_init_prealloc(&C, 2);
-    tlas_rebuild(&C, &C.blas, wpn.mdl.nv ? &wpn.blas : NULL);
+    // Report the final spawn position
+    printf ("[spawn] placed at (%.1f, %.1f, %.1f)\n", Player_Data.Position.x, Player_Data.Position.y, Player_Data.Position.z);
 
-    pipeline_rt_create(&C);
-    sbt_create(&C);
-    desc_create(&C, &wpn);
+  // Use a fixed default position for the test scene
+  } else {
+    Player_Data.Position = V3_Make (0, 2 - DEFAULT_VIEW_HEIGHT, 8);
+  }
 
-    export_validate_json(&C, &sc, map);
+  // Capture the mouse and enter the main loop
+  SDL_SetRelativeMouseMode (SDL_TRUE);
+  U64 Time_Start    = SDL_GetTicks64 ();
+  U32 Frame_Counter = 0;
+  while (not Context.Quit) {
 
-    Player player = {0};
-    player.viewheight = DEFAULT_VIEWHEIGHT;
-    F32 smooth_cam_y = 0; /* smoothed camera Y — initialized after spawn */
-    int cam_y_init = 0;
-    if (map) {
-        player.yaw = (90.f - spawn.angle) * (F32)M_PI / 180.f;
+    // Compute the frame delta time
+    U64 Time_Current = SDL_GetTicks64 ();
+    Context.Delta_Time = (Time_Current - Time_Start) * 0.001f;
+    Time_Start = Time_Current;
 
-        /* place player at spawn, nudge up if inside solid, then drop to floor */
-        {
-            V3 stand = v3(15, 32, 15);
-            player.pos = spawn.origin;
-            /* nudge upward out of solid (capsule may clip into floor at spawn) */
-            for (int i = 0; i < 128; i++) {
-                Trace t = cm_trace(player.pos, player.pos, PM_MINS, stand, &col, 1);
-                if (!t.allsolid) break;
-                player.pos.y += 1.f;
-            }
-            /* drop to floor from current valid position */
-            V3 down = v3add(player.pos, v3(0, -256, 0));
-            Trace drop = cm_trace(player.pos, down, PM_MINS, stand, &col, 1);
-            if (drop.fraction < 1.f && !drop.allsolid)
-                player.pos = drop.endpos;
-            printf("[spawn] placed at (%.1f, %.1f, %.1f)\n",
-                   player.pos.x, player.pos.y, player.pos.z);
-        }
-    } else {
-        player.pos = v3(0, 2 - DEFAULT_VIEWHEIGHT, 8);
+    // Poll input and advance the player physics
+    Input Input_Data = Poll_Input (&Context);
+    Player_Move (&Player_Data, Map_Path ? &Collision : NULL, Input_Data, Context.Delta_Time);
+
+    // Smooth the camera Y to absorb stair steps and crouch transitions
+    {
+      F32 Target_Camera_Y = Player_Data.Position.y + Player_Data.View_Height;
+      if (not Camera_Y_Initialized) {
+        Smoothed_Camera_Y    = Target_Camera_Y;
+        Camera_Y_Initialized = 1;
+      }
+      F32 Camera_Y_Difference = Target_Camera_Y - Smoothed_Camera_Y;
+      if (Camera_Y_Difference < -48.f)
+        Smoothed_Camera_Y = Target_Camera_Y;
+      else
+        Smoothed_Camera_Y += Camera_Y_Difference * fminf (12.f * Context.Delta_Time, 1.f);
     }
 
-    SDL_SetRelativeMouseMode(SDL_TRUE);
-    U64 t0    = SDL_GetTicks64();
-    U32 frame = 0;
+    // Build the camera state for this frame
+    Camera Camera_Data = {
+      .Position = V3_Make (Player_Data.Position.x, Smoothed_Camera_Y, Player_Data.Position.z),
+      .Yaw      = Player_Data.Yaw,
+      .Pitch    = Player_Data.Pitch,
+      .Frame    = Frame_Counter++,
+    };
 
-    while (!C.quit) {
-        U64 t1 = SDL_GetTicks64();
-        C.dt   = (t1 - t0) * 0.001f;
-        t0     = t1;
-
-        Input in = poll_input(&C);
-        player_move(&player, map ? &col : NULL, in, C.dt);
-
-        /* smooth camera Y: absorbs stair steps, crouch transitions, etc. */
-        {
-            F32 target = player.pos.y + player.viewheight;
-            if (!cam_y_init) { smooth_cam_y = target; cam_y_init = 1; }
-            F32 diff = target - smooth_cam_y;
-            if (diff < -48.f)
-                smooth_cam_y = target; /* big fall — snap, don't float */
-            else
-                smooth_cam_y += diff * fminf(12.f * C.dt, 1.f);
-        }
-
-        Cam cam = { .pos = v3(player.pos.x, smooth_cam_y, player.pos.z),
-                    .yaw = player.yaw, .pitch = player.pitch,
-                    .frame = frame++ };
-
-        if (wpn.mdl.nv) {
-            wpn_update(&wpn, &cam, C.dt, in.fire);
-            wpn_blas_rebuild(&C, &wpn);
-            tlas_rebuild(&C, &C.blas, &wpn.blas);
-        }
-
-        cam_upload(&C, &cam, 90.f, wpn.wpn_tex_base);
-        rt_frame(&C);
+    // Update and rebuild the weapon's geometry if the weapon model is loaded
+    if (Weapon_Data.Model.Vertex_Count) {
+      Weapon_Update (&Weapon_Data, &Camera_Data, Context.Delta_Time, Input_Data.Fire);
+      Weapon_Bottom_Level_Rebuild (&Context, &Weapon_Data);
+      Top_Level_Rebuild (&Context, &Context.Bottom_Level, &Weapon_Data.Bottom_Level);
     }
 
-    vkDeviceWaitIdle(C.dev);
-    SDL_DestroyWindow(C.win);
-    SDL_Quit();
-    return 0;
+    // Upload camera matrices and render the frame
+    Camera_Upload (&Context, &Camera_Data, 90.f, Weapon_Data.Texture_Base_Index);
+    Raytracing_Frame (&Context);
+  }
+
+  // Clean up
+  vkDeviceWaitIdle (Context.Device);
+  SDL_DestroyWindow (Context.Window);
+  SDL_Quit ();
+  return 0;
 }
