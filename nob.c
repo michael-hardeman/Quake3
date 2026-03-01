@@ -1,7 +1,7 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 
-#define SRC   "."
+#define SRC   "./"
 #define BUILD "build/"
 #define SPVD  BUILD "shaders/"
 #define MAIN  SRC "quake3.c"

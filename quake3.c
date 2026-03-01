@@ -1148,8 +1148,8 @@ Weapon_Model Weapon_Model_Load (void) {
       Surface_Cursor += ((const Md3_Surface *)Surface_Cursor)->End_Offset;
     }
     free (Barrel_Data);
-    printf (/*format =>*/ "[weapon] barrel merged,
-            tag_barrel=(%.1f,%.1f,%.1f)\n",
+    printf (/*format =>*/ "[weapon] barrel merged, "
+            "tag_barrel=(%.1f,%.1f,%.1f)\n",
             Result.Tag_Barrel[0],
             Result.Tag_Barrel[1],
             Result.Tag_Barrel[2]);
@@ -1188,9 +1188,9 @@ Weapon_Model Weapon_Model_Load (void) {
   }
 
   // Report the loaded weapon geometry statistics
-  printf (/*format =>*/ "[weapon] loaded: %u vertices,
-          %u triangles,
-          %u surfaces\n",
+  printf (/*format =>*/ "[weapon] loaded: %u vertices, "
+          "%u triangles, "
+          "%u surfaces\n",
           Result.Vertex_Count,
           Result.Triangle_Count,
           Result.Surface_Count);
@@ -1948,11 +1948,11 @@ Scene Scene_Load_From_Bsp (const char *Path, Spawn *Out_Spawn, Collision_Map *Ou
     Collision->Check_Counter = 0;
 
     // Report the collision map statistics
-    printf (/*format =>*/ "[collision] %u planes,
-            %u nodes,
-            %u leafs,
-            %u brushes,
-            %u sides\n",
+    printf (/*format =>*/ "[collision] %u planes, "
+            "%u nodes, "
+            "%u leafs, "
+            "%u brushes, "
+            "%u sides\n",
             Collision->Plane_Count,
             Collision->Node_Count,
             Collision->Leaf_Count,
@@ -2972,7 +2972,7 @@ void Player_Move (Player *State, Collision_Map *Collision, Input Input_Data, F32
 /* Build a minimal test scene with a ground plane and a small triangular prism for development. */
 
 Scene Scene_Build_Test (void) {
-  Vertex Test_Vertices[] = {
+  static Vertex Test_Vertices[] = {
     {.Position = {-10, 0, -10}, .Texture_Uv = { 0,  1}, .Normal = { 0, 1,  0}},
     {.Position = { 10, 0, -10}, .Texture_Uv = { 1,  1}, .Normal = { 0, 1,  0}},
     {.Position = { 10, 0,  10}, .Texture_Uv = { 1,  0}, .Normal = { 0, 1,  0}},
@@ -2988,9 +2988,9 @@ Scene Scene_Build_Test (void) {
     {.Position = {  2, 0,  -4}, .Texture_Uv = { 0,  1}, .Normal = { 1, 0,  0}},
     {.Position = {  2, 0,   0}, .Texture_Uv = { 1,  1}, .Normal = { 1, 0,  0}},
   };
-  U32 Test_Indices[]     = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 11, 12, 13 };
-  V4  Test_Materials[]   = {{0.55f, 0.52f, 0.48f, 1}, {0.85f, 0.42f, 0.15f, 1}, {0.25f, 0.60f, 0.85f, 1}};
-  U32 Test_Texture_Ids[] = {0, 0, 0, 0, 0, 0 };
+  static U32 Test_Indices[]     = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 11, 12, 13 };
+  static V4  Test_Materials[]   = {{0.55f, 0.52f, 0.48f, 1}, {0.85f, 0.42f, 0.15f, 1}, {0.25f, 0.60f, 0.85f, 1}};
+  static U32 Test_Texture_Ids[] = {0, 0, 0, 0, 0, 0 };
 
   return (Scene){
     .Vertices    = Test_Vertices,    .Vertex_Count   = 14,
@@ -3059,8 +3059,8 @@ void Scene_Load_Textures (Vulkan_Context *Context, const Scene *Scene_Data) {
                                                     /*Size            =>*/ sizeof (U32) * Scene_Data->Triangle_Count,
                                                     /*Usage           =>*/ VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-  printf ("[textures] loaded %u/%u textures,
-          %u fallbacks\n",
+  printf ("[textures] loaded %u/%u textures, "
+          "%u fallbacks\n",
           Context->Textures_Loaded,
           Context->Texture_Count,
           Context->Texture_Count - Context->Textures_Loaded);
@@ -3675,8 +3675,8 @@ void Raytracing_Pipeline_Create (Vulkan_Context *Context) {
   // Load the four SPIR-V shader modules
   VkShaderModule Ray_Generation = Shader_Module_Load (Context->Device, "build/shaders/Ray_Generation.spv");
   VkShaderModule Closest_Hit    = Shader_Module_Load (Context->Device, "build/shaders/Closest_Hit.spv");
-  VkShaderModule Primary_Miss   = Shader_Module_Load (Context->Device, "build/shaders/Ray_Miss.spv");
-  VkShaderModule Shadow_Miss    = Shader_Module_Load (Context->Device, "build/shaders/Shadow_Ray_Miss.spv");
+  VkShaderModule Primary_Miss   = Shader_Module_Load (Context->Device, "build/shaders/Primary_Miss.spv");
+  VkShaderModule Shadow_Miss    = Shader_Module_Load (Context->Device, "build/shaders/Shadow_Miss.spv");
 
   // Define the pipeline shader stages
   VkPipelineShaderStageCreateInfo Stages[] = {
@@ -3906,7 +3906,7 @@ void Weapon_Update (Weapon_Instance *Weapon, const Camera *Camera_Data, F32 Delt
   F32 Cosine_Pitch = cosf (Camera_Data->Pitch);
   F32 Sine_Pitch   = sinf (Camera_Data->Pitch);
 
-  V3 Forward = V3_Make (-Sine_Pitch, Cosine_Pitch, -Cosine_Yaw * Cosine_Pitch);
+  V3 Forward = V3_Make (Sine_Yaw * Cosine_Pitch, -Sine_Pitch, -Cosine_Yaw * Cosine_Pitch);
   V3 Right   = V3_Normalize (V3_Cross (Forward, V3_Make (0, 1, 0)));
   V3 Up      = V3_Cross (Right, Forward);
 
